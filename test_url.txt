@@ -1,0 +1,4 @@
+# Replace this URL with a real YouTube Shorts (or Instagram Reel) link
+# before running the test cell. Keep it under 60 seconds, public, single speaker.
+# Example format (do NOT commit a real link here if it's private):
+TEST_URL = "https://www.youtube.com/shorts/REPLACE_ME"

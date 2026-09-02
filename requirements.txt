@@ -1,0 +1,13 @@
+# YouDub — light dependencies for the dubbing pipeline.
+# CosyVoice3 itself is NOT installed from here; it is set up via the
+# FunAudioLLM/CosyVoice Git clone (see setup_colab.md) because the
+# `cosyvoice` Python package and Matcha-TTS submodule only ship from there.
+#
+# Pin loosely — these are the versions verified on a Colab T4 (Python 3.10).
+
+yt-dlp>=2024.8.6
+faster-whisper>=1.0.3
+ffmpeg-python>=0.2.0
+huggingface_hub>=0.24.0
+ollama>=0.3.0
+requests>=2.32.0

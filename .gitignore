@@ -1,0 +1,113 @@
+# ---------- Python ----------
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Linters / formatters / type checkers
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# ---------- Generated media / pipeline outputs ----------
+outputs/
+out/
+runs/
+work/
+
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.flv
+
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+
+# Sidecar / debug audio
+*.srt
+*.vtt
+*.json.gz
+
+# ---------- Model weights & large downloads ----------
+# PyTorch checkpoints
+*.pt
+*.pth
+# ONNX (CosyVoice ships these — see HF model card)
+*.onnx
+# Hugging Face / newer PyTorch
+*.safetensors
+# TTS / model snapshots
+pretrained_models/
+checkpoints/
+models/
+*.bin
+
+# If you clone the upstream CosyVoice repo alongside this project
+# (e.g. for local testing without going through Drive), keep it out
+# of git. The Colab setup cell clones it into Drive instead.
+CosyVoice/
+Fun-CosyVoice3-0.5B/
+
+# HF / modelscope caches
+.huggingface/
+.cache/huggingface/
+modelscope_cache/
+
+# ---------- Secrets & local config ----------
+.env
+.env.*
+*.env
+ngrok.yml
+ngrok.yaml
+secrets/
+config.local.*
+service-account*.json
+*.pem
+*.key
+
+# ---------- IDE / editor ----------
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Jupyter ----------
+# Don't commit the checkpoint folders, but DO commit the notebooks
+# themselves (with outputs — they're proof of functionality).
+.ipynb_checkpoints/
+*.ipynb.tmp
+
+# Allow .ipynb files even though some ignore sets exclude them
+!*.ipynb
