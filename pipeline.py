@@ -78,9 +78,14 @@ COSYVOICE_MODEL_DIR = os.environ.get(
 # if Ollama runs on a separate machine.
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
-# Hugging Face model id (the agiws mirror is identical content to the
-# canonical FunAudioLLM repo; the spec asks for agiws).
-HF_MODEL_ID = os.environ.get("YOUDUB_HF_MODEL_ID", "agiws/Fun-CosyVoice3-0.5B")
+# Hugging Face model id. The `-2512` suffix is the official 2025-12 release of
+# Fun-CosyVoice3-0.5B (base weights only — no bundled Python source). The
+# `cosyvoice` Python package comes from the FunAudioLLM/CosyVoice Git clone,
+# configured via COSYVOICE_REPO_DIR. The previously used agiws/Fun-CosyVoice3-0.5B
+# mirror became unreachable (401) during the hackathon.
+HF_MODEL_ID = os.environ.get(
+    "YOUDUB_HF_MODEL_ID", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
+)
 
 
 # ----------------------------------------------------------------------------

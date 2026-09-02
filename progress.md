@@ -45,13 +45,13 @@ Supporting infrastructure:
   Cross-lingual is the canonical CosyVoice3 path for source-LANG audio →
   target-LANG speech and avoids needing a source-language `prompt_text`,
   which is the most common source of voice-clone quality regression.
-- **CosyVoice3 weights via `snapshot_download('agiws/Fun-CosyVoice3-0.5B')`
-  but the `cosyvoice` Python package from the upstream git clone.** The HF
-  repo contains only `.pt` weights + `cosyvoice3.yaml`; the `AutoModel`
-  class and Matcha-TTS dependency live in `FunAudioLLM/CosyVoice`.
-  Therefore the setup cell does both: `git clone --recursive` the upstream
-  repo, then `snapshot_download` the agiws weights into the repo's
-  `pretrained_models/` subdirectory.
+- **CosyVoice3 weights via `snapshot_download('FunAudioLLM/Fun-CosyVoice3-0.5B-2512')`**
+  into the cloned `FunAudioLLM/CosyVoice` repo's
+  `pretrained_models/Fun-CosyVoice3-0.5B` subdirectory (the upstream-
+  recommended layout; the local directory name drops the `-2512` suffix
+  per the official README). The `cosyvoice` Python package and
+  `Matcha-TTS` submodule come from the git clone, never from the HF
+  repo.
 - **Ollama host via `OLLAMA_HOST` env var, default `localhost:11434`.**
   Lets the same code work whether Ollama runs on the Colab T4 (will OOM
   with CosyVoice3 loaded), on the user's laptop, or on a separate GPU box.
@@ -169,7 +169,7 @@ files plus the output-laden notebooks, never the 10 GB of weights.
 
 ### Errors & Fixes
 
-*(Fill this in as you test in Colab. Format:*
+*(Format:*
 
 - **`<date>` — `<short error message>`**
   - What happened:
@@ -178,4 +178,26 @@ files plus the output-laden notebooks, never the 10 GB of weights.
   - Root cause (if known):
   - Fix to apply in code:
 )*
+
+- **mid-hackathon — `snapshot_download('agiws/Fun-CosyVoice3-0.5B')` raised `RepositoryNotFoundError` (401)**
+  - What happened: First end-to-end Colab run died at the weights-download
+    cell with a HF 401 on the agiws mirror; the repo had gone private
+    or been taken down.
+  - What I tried: Re-running the cell, refreshing the HF token — both failed
+    because the namespace itself was returning 401.
+  - What worked: Switching to the official upstream weights repo
+    `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`, which is public and mirrors
+    the same `cosyvoice3.yaml` + `.pt`/`.onnx` file layout.
+  - Root cause: The agiws namespace was a third-party mirror; the owner
+    removed/restricted it. We had been using it as a convenience and should
+    have used the canonical FunAudioLLM repo from the start.
+  - Fix applied: `pipeline.py` — `HF_MODEL_ID` env var now defaults to
+    `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`. `setup_colab.md` Cell 5 now
+    `snapshot_download`s from the same id into
+    `pretrained_models/Fun-CosyVoice3-0.5B` (no `-2512` suffix in the
+    local dir, matching the upstream README's example). `progress.md`
+    decision log updated. Bonus simplification: the official repo contains
+    only weights, which is actually a better fit for our existing setup —
+    the Python source already comes from the `FunAudioLLM/CosyVoice` git
+    clone, so we never needed the agiws bundled `cosyvoice_src/` folder.
 

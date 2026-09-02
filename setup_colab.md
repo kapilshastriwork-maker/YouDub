@@ -84,9 +84,9 @@ model_dir = os.environ["COSYVOICE_MODEL_DIR"]
 if os.path.isdir(model_dir) and os.path.isfile(f"{model_dir}/cosyvoice3.yaml"):
     print(f"Model already at {model_dir}; skipping download")
 else:
-    print(f"Snapshot-downloading agiws/Fun-CosyVoice3-0.5B -> {model_dir}")
+    print(f"Snapshot-downloading FunAudioLLM/Fun-CosyVoice3-0.5B-2512 -> {model_dir}")
     snapshot_download(
-        "agiws/Fun-CosyVoice3-0.5B",
+        "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
         local_dir=model_dir,
         # 9.75 GB total; allow resume
         max_workers=4,
