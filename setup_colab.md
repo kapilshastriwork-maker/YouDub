@@ -1,134 +1,80 @@
-# YouDub — Colab Setup & Test Notebook
+# YouDub — Colab Runner Notebook
 
-Copy each cell block into a fresh Colab notebook. The cells are idempotent
-(rerunning them on a warm Drive won't re-download the world).
+This notebook is a **thin runner**. All actual setup logic lives in
+`scripts/colab_setup.py` in the repo, so fixes only need to happen in one
+place (the repo). Re-running cells is safe; the setup script is idempotent.
 
 Recommended runtime: **T4 GPU**, **High RAM**.
 
----
-
-## Cell 1 — Mount Drive and set paths
-
-```python
-from google.colab import drive
-drive.mount('/content/drive')
-
-# Where everything lives. Edit if you want a different Drive folder.
-import os
-DRIVE_ROOT = "/content/drive/MyDrive/YouDub"
-os.makedirs(DRIVE_ROOT, exist_ok=True)
-os.environ["DRIVE_ROOT"] = DRIVE_ROOT
-os.environ["COSYVOICE_REPO_DIR"] = f"{DRIVE_ROOT}/CosyVoice"
-os.environ["COSYVOICE_MODEL_DIR"] = f"{DRIVE_ROOT}/CosyVoice/pretrained_models/Fun-CosyVoice3-0.5B"
-os.environ["OLLAMA_HOST"] = "http://localhost:11434"  # change if remote
-!echo "DRIVE_ROOT=$DRIVE_ROOT"
-```
+> **Deprecated:** The previous 11 inline setup cells are gone. If you're
+> following a tutorial or older doc that references them, ignore it — the
+> script is the source of truth. See `progress.md` → "## Infrastructure".
 
 ---
 
-## Cell 2 — System deps (ffmpeg, sox, git-lfs)
-
-```python
-!apt-get update -qq
-!apt-get install -y -qq ffmpeg sox libsox-dev git-lfs
-!git lfs install
-!ffmpeg -version | head -1
-```
-
----
-
-## Cell 3 — Light Python deps (yt-dlp, faster-whisper, ollama, etc.)
-
-```python
-# These don't conflict with CosyVoice's pinned versions.
-!pip install -q -U "yt-dlp>=2024.8.6" \
-                   "faster-whisper>=1.0.3" \
-                   "ffmpeg-python>=0.2.0" \
-                   "huggingface_hub>=0.24.0" \
-                   "ollama>=0.3.0" \
-                   "requests>=2.32.0"
-!pip install -q -U ipywidgets
-```
-
----
-
-## Cell 4 — Clone CosyVoice (idempotent)
+## Cell 1 — Clone or update the YouDub repo
 
 ```python
 import os, subprocess
-repo = os.environ["COSYVOICE_REPO_DIR"]
-if not os.path.isdir(repo):
-    print(f"Cloning CosyVoice into {repo} (one-time, takes a minute)...")
-    os.makedirs(os.path.dirname(repo), exist_ok=True)
+PROJ = "/content/drive/MyDrive/YouDub"   # YouDub project root on Drive
+if not os.path.isdir(f"{PROJ}/.git"):
+    print(f"Cloning YouDub into {PROJ} (one-time)...")
+    os.makedirs(PROJ, exist_ok=True)
     subprocess.check_call([
-        "git", "clone", "--recursive",
-        "https://github.com/FunAudioLLM/CosyVoice.git", repo,
+        "git", "clone",
+        "https://github.com/kapilshastriwork-maker/YouDub.git", PROJ,
     ])
 else:
-    print(f"CosyVoice already at {repo}; pulling latest + updating submodules")
-    subprocess.check_call(["git", "-C", repo, "pull", "--recurse-submodules"])
-# Make sure submodules are present even on a partial previous clone.
-subprocess.check_call(["git", "-C", repo, "submodule", "update", "--init", "--recursive"])
-!ls "$COSYVOICE_REPO_DIR/third_party/Matcha-TTS" | head -3
+    print(f"Pulling latest YouDub into {PROJ}...")
+    subprocess.check_call(["git", "-C", PROJ, "pull", "--rebase"])
+# Print last commit so you can confirm you got the version you expected.
+print(subprocess.check_output(["git", "-C", PROJ, "log", "-1", "--oneline"],
+                              text=True).strip())
 ```
 
 ---
 
-## Cell 5 — Download CosyVoice3 weights from Hugging Face (idempotent)
+## Cell 2 — Run the setup script
+
+This single call handles: ffmpeg install, light pip deps, CosyVoice clone,
+weights download, CosyVoice pinned requirements, and an AutoModel import
+sanity check. Re-running skips anything already done.
 
 ```python
+!python "{PROJ}/scripts/colab_setup.py"
+```
+
+---
+
+## Cell 3 — Make the env vars visible to subsequent Colab cells
+
+The setup script writes `scripts/colab_env.sh`; `source` it to inherit the
+exported variables (Drive path, CosyVoice repo, model dir, Ollama host) in
+this Colab Python process.
+
+```python
+!source "{PROJ}/scripts/colab_env.sh"
 import os
-from huggingface_hub import snapshot_download
-
-model_dir = os.environ["COSYVOICE_MODEL_DIR"]
-if os.path.isdir(model_dir) and os.path.isfile(f"{model_dir}/cosyvoice3.yaml"):
-    print(f"Model already at {model_dir}; skipping download")
-else:
-    print(f"Snapshot-downloading FunAudioLLM/Fun-CosyVoice3-0.5B-2512 -> {model_dir}")
-    snapshot_download(
-        "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
-        local_dir=model_dir,
-        # 9.75 GB total; allow resume
-        max_workers=4,
-    )
-!du -sh "$COSYVOICE_MODEL_DIR"
+for k in ("DRIVE_ROOT", "COSYVOICE_REPO_DIR", "COSYVOICE_MODEL_DIR", "OLLAMA_HOST"):
+    print(f"  {k}={os.environ.get(k)}")
 ```
 
 ---
 
-## Cell 6 — Install CosyVoice's pinned requirements
+## Cell 4 — (Optional) Install or pull Ollama
+
+Only run this if you want Ollama on the same Colab box. If you have Ollama
+running elsewhere, set `OLLAMA_HOST` in `scripts/colab_env.sh` (or pass
+`--ollama-host http://your-gpu-box:11434` to `colab_setup.py`) and skip
+this cell.
 
 ```python
-import os, subprocess
-repo = os.environ["COSYVOICE_REPO_DIR"]
-# Run pip from inside the clone so the relative requirements.txt path resolves.
-print("Installing CosyVoice's pinned requirements (this can take 2-3 minutes)...")
-subprocess.check_call(["pip", "install", "-q", "-r", "requirements.txt"], cwd=repo)
-print("Done. Sanity-check:")
-!python -c "import sys; sys.path.insert(0, '$COSYVOICE_REPO_DIR'); sys.path.insert(0, '$COSYVOICE_REPO_DIR/third_party/Matcha-TTS'); from cosyvoice.cli.cosyvoice import AutoModel; print('AutoModel import OK')"
-```
-
-> **If `import AutoModel` fails on Colab**, the most common cause is an
-> onnxruntime / numpy version drift. Re-run with `pip install --upgrade
-> onnxruntime numpy==1.26.4` in the CosyVoice directory.
-
----
-
-## Cell 7 — Install Ollama (only if you want local translation)
-
-```python
-# Skip this cell entirely if OLLAMA_HOST points to a remote box.
-
+# Install Ollama
 !curl -fsSL https://ollama.com/install.sh | sh
-# Run ollama serve in the background
-import subprocess, time, os
-os.makedirs(os.path.expanduser("~/.ollama"), exist_ok=True)
-serve = subprocess.Popen(
-    ["ollama", "serve"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-)
-# Wait for the port to come up.
-import urllib.request, socket
+# Start the server in the background
+import subprocess, time, urllib.request
+serve = subprocess.Popen(["ollama", "serve"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 for _ in range(30):
     try:
         with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1) as r:
@@ -136,55 +82,35 @@ for _ in range(30):
     except Exception:
         time.sleep(1)
 print("Ollama serving on http://localhost:11434")
-```
-
-> **Warning:** Ollama on the same T4 as CosyVoice3 will OOM. Default to
-> `OLLAMA_HOST=http://<your-gpu-box>:11434` and skip this cell.
-
----
-
-## Cell 8 — Pull the translation model
-
-```python
-import os, ollama
+# Pull the translation model
+import ollama
 ollama.pull(os.environ.get("OLLAMA_MODEL", "llama3.1:8b"))
 !ollama list
 ```
 
+> **Warning:** Running Ollama on the same T4 as CosyVoice3 risks OOM.
+> Default to `OLLAMA_HOST=http://<your-gpu-box>:11434` and skip this cell.
+
 ---
 
-## Cell 9 — Add project to `sys.path` and smoke-test imports
+## Cell 5 — Run the end-to-end pipeline test
 
 ```python
 import os, sys
-PROJ = "/content/drive/MyDrive/YouDub"  # the folder containing pipeline.py
-if PROJ not in sys.path:
-    sys.path.insert(0, PROJ)
-# Make CosyVoice importable too
-if os.environ["COSYVOICE_REPO_DIR"] not in sys.path:
-    sys.path.insert(0, os.environ["COSYVOICE_REPO_DIR"])
-if os.path.join(os.environ["COSYVOICE_REPO_DIR"], "third_party", "Matcha-TTS") not in sys.path:
-    sys.path.insert(0, os.path.join(os.environ["COSYVOICE_REPO_DIR"], "third_party", "Matcha-TTS"))
+PROJ = os.environ["DRIVE_ROOT"]
+for p in (PROJ,
+          os.environ["COSYVOICE_REPO_DIR"],
+          os.path.join(os.environ["COSYVOICE_REPO_DIR"], "third_party", "Matcha-TTS")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import pipeline
-print("Pipeline version: Phase 1")
-for name in ["download_video", "transcribe_audio", "translate_segments",
-             "extract_reference_voice", "synthesize_dubbed_audio",
-             "time_align_segment", "mux_final_video", "run_pipeline"]:
-    print(f"  {name:30s} {getattr(pipeline, name).__doc__.splitlines()[0].strip()}")
-```
 
----
-
-## Cell 10 — Run the end-to-end test
-
-```python
 # EDIT THIS to a real, public, sub-60s Shorts/Reel before running.
 TEST_URL = "https://www.youtube.com/shorts/REPLACE_ME"
 TARGET_LANG = "Spanish"
-OUTPUT_DIR = "/content/drive/MyDrive/YouDub/runs/test_run"
+OUTPUT_DIR = os.path.join(PROJ, "runs/test_run")
 
-# Recommended first run: a 15-30s English clip -> Spanish, to validate timing.
 final = pipeline.run_pipeline(
     url=TEST_URL,
     target_lang=TARGET_LANG,
@@ -199,22 +125,26 @@ files.download(final)
 
 ---
 
-## Cell 11 — Sanity check: compare durations
+## Cell 6 — Sanity check: compare durations
 
 ```python
-# Run this AFTER the pipeline to confirm the dubbed video length matches the
-# original within ~0.5s (it should, because we time-align each segment).
-import subprocess, json
+import os, subprocess, json
 def dur(p):
     out = subprocess.check_output(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "json", p], text=True
-    )
+         "-of", "json", p], text=True)
     return float(json.loads(out)["format"]["duration"])
 
-orig = "/content/drive/MyDrive/YouDub/runs/test_run/work/<id>.mp4"  # or copy
-# final = OUTPUT_DIR + "/dubbed_Spanish.mp4"
-# print(f"Original: {dur(orig):.2f}s   Dubbed: {dur(final):.2f}s")
+# Find the original and the dubbed video inside the run's work/ dir.
+import glob
+work_dir = os.path.join(OUTPUT_DIR, "work")
+orig_candidates = glob.glob(f"{work_dir}/*.mp4")
+orig = orig_candidates[0] if orig_candidates else None
+dubbed = final
+if orig:
+    print(f"Original: {dur(orig):.2f}s")
+    print(f"Dubbed:   {dur(dubbed):.2f}s")
+    print(f"Delta:    {abs(dur(orig) - dur(dubbed)):.2f}s (should be < 0.5s)")
 ```
 
 ---
@@ -226,3 +156,23 @@ orig = "/content/drive/MyDrive/YouDub/runs/test_run/work/<id>.mp4"  # or copy
 import torch, gc
 gc.collect(); torch.cuda.empty_cache()
 ```
+
+---
+
+## Troubleshooting
+
+- **"AutoModel import OK" never prints.** Usually an onnxruntime / numpy
+  version drift. From the CosyVoice dir:
+  `pip install -U onnxruntime numpy==1.26.4`
+- **`snapshot_download` raises 401 / RepositoryNotFoundError.** The HF
+  repo id may have changed. Pass `--hf-model-id` to the setup script with
+  a working id, and update `scripts/colab_setup.py` → `DEFAULT_HF_MODEL_ID`.
+- **Ollama cell 4 hangs on `curl https://ollama.com/install.sh`.** You're
+  probably on a restricted network. Skip local Ollama and set
+  `OLLAMA_HOST` in `scripts/colab_env.sh` instead.
+- **Setup script did 5 GB of work but my fix wasn't picked up.** You
+  probably forgot to re-run Cell 1 (`git pull`). Re-run cells in order
+  1 → 2 → 3 → 5.
+
+For anything that needs more than a one-line fix, append an entry to
+`progress.md` → "### Errors & Fixes" so the next session has context.

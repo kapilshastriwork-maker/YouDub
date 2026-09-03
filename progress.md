@@ -6,6 +6,62 @@ Google Colab T4 GPU.
 
 ---
 
+## Infrastructure
+
+### Colab runner architecture (refactored)
+
+**Problem.** Earlier versions of `setup_colab.md` contained 11 inline
+notebook cells — apt installs, pip installs, CosyVoice cloning, weights
+download, the AutoModel import test — written directly as cell code.
+Every time something broke in Colab, the fix had to be re-described back
+into the local repo, and the two drifted out of sync within a day.
+
+**Fix (current).** The Colab notebook is now a thin runner. All setup
+logic lives in `scripts/colab_setup.py` in this repo, and the notebook
+contains only:
+
+1. **Cell 1** — `git clone` / `git pull` the YouDub repo.
+2. **Cell 2** — `!python scripts/colab_setup.py` (one call, all setup).
+3. **Cell 3** — `!source scripts/colab_env.sh` so env vars cross the
+   subshell boundary into the Colab Python process.
+4. **Cell 4** — *(optional)* Install / pull Ollama if running locally.
+5. **Cell 5** — Run the pipeline test (`pipeline.run_pipeline(...)`).
+6. **Cell 6** — Sanity-check: original vs dubbed duration.
+
+Any fix to the setup flow now happens once, in `scripts/colab_setup.py`,
+and propagates to Colab on the next `git pull` + re-run.
+
+**Why Python (not bash).** The setup needs `apt-get`, `pip`, `subprocess`,
+HF `snapshot_download` (a Python call), and an `urllib` polling loop for
+Ollama. A bash script would shell out to `python -c` for the Python parts
+anyway. A single `.py` file is one Colab cell.
+
+**Idempotency.** Each of the 7 stages in the script has a guard:
+file-existence checks for the CosyVoice clone and weights download; a
+`.youdub_cosyv_deps_installed` marker file for the heavy `pip install
+-r requirements.txt`; `which` checks for system packages; `pip show`
+checks for Python packages. Re-running the script is a no-op when the
+environment is already warm.
+
+**Environment variable propagation.** The script writes
+`scripts/colab_env.sh` with the four key vars (`DRIVE_ROOT`,
+`COSYVOICE_REPO_DIR`, `COSYVOICE_MODEL_DIR`, `OLLAMA_HOST`) and the HF
+model id. A Colab cell then `source`s the file. `colab_env.sh` is in
+`.gitignore` because it's host-specific (regenerated on every setup run).
+
+**CLI flags.** The script accepts `--drive-root`, `--ollama-host`,
+`--hf-model-id`, `--cosyvoice-branch`, and five `--skip-*` flags. The
+99% case is no flags at all.
+
+### Deprecation note
+
+The 11-cell inline setup approach is **deprecated** as of this refactor.
+Any older tutorial, doc, or comment that references inline cells is
+outdated. The script is the single source of truth. If you find a gap,
+add a stage to `colab_setup.py` rather than another inline cell.
+
+---
+
 ## Phase 1 — Core Pipeline
 
 ### What was built
@@ -119,11 +175,13 @@ Supporting infrastructure:
 
 ```
 YouDub/
-├── .gitignore              # excludes weights, generated media, secrets
+├── .gitignore              # excludes weights, generated media, secrets, colab_env.sh
 ├── pipeline.py             # the 8 functions + helpers (this is the core)
 ├── requirements.txt        # light deps (install first)
 ├── cosyv_requirements.txt  # reference copy of CosyVoice's pinned deps
-├── setup_colab.md          # 11-cell Colab setup guide
+├── scripts/
+│   └── colab_setup.py      # single source of truth for Colab setup
+├── setup_colab.md          # 6-cell thin runner notebook guide
 ├── test_url.txt            # placeholder for the test Shorts URL
 └── progress.md             # this file
 ```
@@ -200,4 +258,28 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     only weights, which is actually a better fit for our existing setup —
     the Python source already comes from the `FunAudioLLM/CosyVoice` git
     clone, so we never needed the agiws bundled `cosyvoice_src/` folder.
+
+- **post-Phase-1 — Colab ↔ local repo drift from inline setup cells**
+  - What happened: Earlier versions of `setup_colab.md` had all setup
+    logic (apt installs, pip, clone, weights, sanity check) baked into
+    11 inline Colab cells. Every Colab debugging cycle required
+    re-describing the fix into the local repo, and the two drifted
+    within a session. The agiws-401 incident (previous entry) was
+    harder to fix than it needed to be because the swap had to be made
+    in both places.
+  - What I tried: Adding more inline cells to handle edge cases —
+    rapidly made the notebook unreadable.
+  - What worked: Refactoring the notebook to a 6-cell thin runner and
+    moving all setup into `scripts/colab_setup.py`. See
+    `## Infrastructure` section above for the full design.
+  - Root cause: Setup was treated as notebook content rather than repo
+    content. Repos are version-controlled and shared; notebooks are
+    session-local. The split was wrong.
+  - Fix applied: New `scripts/colab_setup.py` (7 idempotent stages,
+    CLI flags, writes `colab_env.sh` for env-var propagation). New
+    `## Infrastructure` section in this file documents the architecture.
+    `setup_colab.md` reduced from 228 lines (11 cells) to ~140 lines
+    (6 cells + troubleshooting). The old inline-cell approach is
+    deprecated — any future setup changes go into the script, not
+    the notebook.
 
