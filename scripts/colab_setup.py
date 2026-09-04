@@ -44,6 +44,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -83,6 +84,11 @@ APT_PACKAGES = ["ffmpeg", "sox", "libsox-dev", "git-lfs"]
 # 1.20+ is API-compatible. Confirmed against cosyvoice/utils/onnx.py and
 # cosyvoice/cli/frontend.py.
 ONNXRUNTIME_VERSION = ">=1.20.0,<1.26.0"
+
+# Name of the temp file we write a filtered copy of CosyVoice's
+# requirements.txt into (with onnxruntime* lines stripped out). Resolved
+# against the system temp dir so it works on both Colab (/tmp) and Windows.
+FILTERED_REQ_FILENAME = "youdub_cosyv_requirements_filtered.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +343,40 @@ def _onnxruntime_pkg_name() -> str:
     return "onnxruntime-gpu" if sys.platform.startswith("linux") else "onnxruntime"
 
 
+def _filter_requirements_txt(text: str) -> tuple[list[str], list[str]]:
+    """Return (kept_lines, dropped_lines) for a requirements.txt body.
+
+    Drops any line whose first non-whitespace token starts with
+    `onnxruntime` — covers both `onnxruntime==1.18.0` and
+    `onnxruntime-gpu==1.18.0; sys_platform == 'linux'`, with or without
+    inline comments. Does NOT drop `onnx==...` (the ONNX format library,
+    which is a different package).
+
+    Preserves the original line text verbatim (including leading
+    whitespace and inline comments) on the kept side. Blank lines and
+    pure-comment lines are passed through unchanged.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw_line in text.splitlines():
+        # Preserve blank lines and pure comments.
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(raw_line)
+            continue
+        # Take the first whitespace-delimited token; that's the package name.
+        first_token = stripped.split()[0]
+        # Strip any inline env-marker ("; sys_platform == 'linux'") from
+        # the package name for the comparison — pip's marker syntax can
+        # appear directly after the name with no space.
+        pkg_name = first_token.split(";", 1)[0].strip()
+        if pkg_name.startswith("onnxruntime"):
+            dropped.append(raw_line)
+        else:
+            kept.append(raw_line)
+    return kept, dropped
+
+
 def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
     if args.skip_cosyv_deps:
         _log("6/7 cosyv-deps", "skipped (--skip-cosyv-deps)")
@@ -351,32 +391,63 @@ def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
 
     ort_pkg = _onnxruntime_pkg_name()
 
-    # Pass 1: install requirements.txt with onnxruntime* excluded.
+    # Pass 1: install requirements.txt with onnxruntime* lines filtered out.
     # CosyVoice's pinned ort==1.18.0 has no cp313 wheel, so resolving
     # requirements.txt as-written fails on Colab's Python 3.13 default.
     # We don't edit the upstream requirements.txt (it lives in a cloned
-    # repo and would be wiped on re-clone) — we exclude the offending
-    # package and pin a compatible range separately below.
-    _log(
-        "6/7 cosyv-deps",
-        f"pip install -r requirements.txt --exclude onnxruntime --exclude onnxruntime-gpu (2-3 min)",
-    )
-    _run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "-r",
-            "requirements.txt",
-            "--exclude",
-            "onnxruntime",
-            "--exclude",
-            "onnxruntime-gpu",
-        ],
-        cwd=repo,
-    )
+    # repo and would be wiped on re-clone) — we write a filtered copy
+    # of the file to a temp path and install from that, then install a
+    # compatible onnxruntime range separately below.
+    #
+    # We do NOT use `pip install --exclude` here because that flag is
+    # not valid for `pip install` (only for `pip download` / `pip list`)
+    # and would exit 2 with `no such option: --exclude`.
+    with open(req, encoding="utf-8") as f:
+        original_text = f.read()
+    kept_lines, dropped_lines = _filter_requirements_txt(original_text)
+    if dropped_lines:
+        for line in dropped_lines:
+            _log("6/7 cosyv-deps", f"  filtering: {line.strip()}")
+    else:
+        _log(
+            "6/7 cosyv-deps",
+            "  warning: no onnxruntime* lines found in requirements.txt; "
+            "filter was a no-op",
+        )
+
+    filtered_path = os.path.join(tempfile.gettempdir(), FILTERED_REQ_FILENAME)
+    Path(filtered_path).write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+    _log("6/7 cosyv-deps", f"wrote filtered requirements -> {filtered_path}")
+    _log("6/7 cosyv-deps", f"pip install -r {filtered_path} (2-3 min)")
+
+    install_failed = False
+    try:
+        _run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "-r",
+                filtered_path,
+            ],
+            cwd=repo,  # kept in case any future requirements.txt uses relative paths
+        )
+    except BaseException:
+        # Mark for retention, then re-raise so the outer stage still
+        # surfaces the failure to run_pipeline.
+        install_failed = True
+        raise
+    finally:
+        # Best-effort cleanup of the temp file on success. If the install
+        # raised, leave the file in place so the user can inspect it.
+        if not install_failed:
+            try:
+                if os.path.isfile(filtered_path):
+                    os.unlink(filtered_path)
+            except OSError:
+                pass
 
     # Pass 2: install the compatible onnxruntime range.
     ort_spec = f"{ort_pkg}{ONNXRUNTIME_VERSION}"

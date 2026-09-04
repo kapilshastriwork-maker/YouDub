@@ -292,9 +292,11 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     in the cloned repo. Realised that would (a) be wiped on the next
     `git pull` and (b) leave no record of the override in our own code.
   - What worked: Two-step install in `scripts/colab_setup.py`:
-    1. `pip install -r requirements.txt --exclude onnxruntime
-       --exclude onnxruntime-gpu` (gets everything else from the pin
-       list normally, just skips the two offending packages).
+    1. Filter the upstream `requirements.txt` content into a temp file
+       with onnxruntime* lines removed, then `pip install -r` the
+       filtered copy (gets everything else from the pin list normally,
+       just skips the two offending packages). See the next entry for
+       why we *don't* use `pip install --exclude`.
     2. `pip install "onnxruntime-gpu>=1.20.0,<1.26.0"` (Linux) or
        `"onnxruntime>=1.20.0,<1.26.0"` (Win/mac — auto-selected by
        `sys.platform`).
@@ -318,4 +320,39 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     explains where the override happens). Bump `ONNXRUNTIME_VERSION`
     in the script if a future CosyVoice release changes its onnx
     requirements.
+
+- **post-Phase-1 — `pip install --exclude` is not a valid flag (usage error, exit 2)**
+  - What happened: First attempted fix for the onnxruntime pin problem
+    (previous entry) used `pip install -r requirements.txt --exclude
+    onnxruntime --exclude onnxruntime-gpu`. That command failed
+    immediately with `no such option: --exclude` and exit code 2.
+  - What I tried: Looked up the pip docs to see if I'd gotten the
+    flag name wrong. Found that `--exclude` is only valid on
+    `pip download` and `pip list`, never on `pip install`. It's a
+    common mistake — the option exists in pip's option parser, just
+    not in the `install` command.
+  - What worked: Filter the requirements file content into a temp file,
+    then `pip install -r` the filtered copy. The filter helper
+    `_filter_requirements_txt` in `scripts/colab_setup.py` drops any
+    line whose first non-whitespace token starts with `onnxruntime`
+    (covers `onnxruntime==1.18.0` and `onnxruntime-gpu==1.18.0` with
+    or without `; sys_platform == ...` markers). It preserves
+    `--extra-index-url` lines, blank lines, comments, and `onnx==1.16.0`
+    (the ONNX format library, a different package). The filtered
+    content is written to `tempfile.gettempdir() /
+    youdub_cosyv_requirements_filtered.txt` and pip-installed from
+    there. On success the file is cleaned up; on failure it's left in
+    place for post-mortem inspection.
+  - Root cause: I assumed pip's `--exclude` flag was universally
+    supported because it's the obvious mechanism for "skip these
+    packages". It's not. `pip install` resolves requirements verbatim
+    — if you want to skip a line, you have to either edit the file or
+    filter its content.
+  - Fix applied: New `_filter_requirements_txt()` helper and
+    `FILTERED_REQ_FILENAME` constant in `scripts/colab_setup.py`.
+    `stage_install_cosyv_deps` now: reads the upstream requirements,
+    filters onnxruntime* lines, writes the filtered copy to a temp
+    file, installs from that, then runs the separate onnxruntime
+    install pass as before. Added a comment in the script warning
+    future maintainers not to re-introduce `--exclude`.
 
