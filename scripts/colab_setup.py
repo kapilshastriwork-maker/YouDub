@@ -6,6 +6,23 @@ the previous 11 inline notebook cells so that fixes only need to happen
 in this repo (not in the Colab notebook). Re-running the script is safe;
 each stage has its own idempotency check.
 
+Two-environment architecture
+----------------------------
+Colab's main kernel is Python 3.13, which has no wheel for CosyVoice3's
+exact pins (torch==2.3.1, numpy==1.26.4, onnxruntime-gpu==1.18.0,
+openai-whisper==20231117). Rather than relax pins (which risks Qwen2
+breakage) or pin Colab to Py3.12 (not viable via the Colab UI), this
+script isolates CosyVoice in its own Python 3.11 venv on Drive:
+
+  - The main Colab kernel (3.13) runs the pipeline orchestration,
+    faster-whisper, Ollama, ffmpeg, and all 8 pipeline functions except
+    the TTS model call.
+  - A Python 3.11 venv at $DRIVE_ROOT/cosyv_venv311 holds CosyVoice's
+    original unmodified requirements.txt.
+  - pipeline.py's synthesize_dubbed_audio spawns a long-running
+    scripts/cosyv_infer.py subprocess in the venv and talks to it
+    over a newline-delimited JSON protocol on stdin/stdout.
+
 Usage from a Colab cell:
 
     !python "{DRIVE_ROOT}/scripts/colab_setup.py"
@@ -17,6 +34,7 @@ CLI flags (all default to "do the thing"; flags are for power users):
                          from env, or /content/drive/MyDrive/YouDub).
     --ollama-host URL    Set OLLAMA_HOST (default: http://localhost:11434).
     --hf-model-id ID     HF repo to download CosyVoice3 weights from.
+    --skip-venv          Skip the Python 3.11 venv creation/refresh.
     --skip-system-deps   Skip apt-get install.
     --skip-pip           Skip pip install of light deps.
     --skip-clone         Skip CosyVoice git clone/pull.
@@ -26,13 +44,15 @@ CLI flags (all default to "do the thing"; flags are for power users):
 
 Stages
 ------
-1. Resolve & export paths (DRIVE_ROOT, COSYVOICE_REPO_DIR, COSYVOICE_MODEL_DIR, OLLAMA_HOST).
-2. System deps (ffmpeg, sox, git-lfs).
-3. Light Python deps (yt-dlp, faster-whisper, ollama, etc.).
-4. Clone or update FunAudioLLM/CosyVoice (with submodules).
-5. Snapshot-download CosyVoice3 weights from Hugging Face.
-6. Install CosyVoice's pinned requirements.
-7. Sanity-check: import AutoModel from the cloned CosyVoice repo.
+1. Resolve & export paths (DRIVE_ROOT, COSYVOICE_REPO_DIR, COSYVOICE_MODEL_DIR,
+   COSYV_VENV_PYTHON, OLLAMA_HOST).
+2. apt-install Python 3.11 + create the venv at $DRIVE_ROOT/cosyv_venv311.
+3. System deps (ffmpeg, sox, git-lfs).
+4. Light Python deps (yt-dlp, faster-whisper, ollama, etc.) into the main env.
+5. Clone or update FunAudioLLM/CosyVoice (with submodules).
+6. Snapshot-download CosyVoice3 weights from Hugging Face.
+7. Install CosyVoice's unmodified requirements.txt into the venv.
+8. Sanity-check: import AutoModel from the cloned CosyVoice repo via the venv.
 
 After all stages, writes scripts/colab_env.sh next to this file with the
 exported env vars so a Colab cell can `source` it and inherit them.
@@ -44,7 +64,6 @@ import argparse
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -59,6 +78,17 @@ DEFAULT_COSYVOICE_REPO_URL = "https://github.com/FunAudioLLM/CosyVoice.git"
 DEFAULT_COSYVOICE_MODEL_DIR_NAME = "Fun-CosyVoice3-0.5B"  # no "-2512" suffix on disk
 DEFAULT_COSYVOICE_BRANCH = "main"
 
+# Python 3.11 is the last version with full wheel support for CosyVoice3's
+# pinned torch 2.3.1, numpy 1.26.4, onnxruntime-gpu 1.18.0,
+# openai-whisper 20231117. Colab's default kernel is 3.13 and we don't
+# try to change that — we install a 3.11 venv on Drive and route CosyVoice
+# work to it via a subprocess.
+PY311_VERSION = "3.11"
+COSYV_VENV_DIRNAME = "cosyv_venv311"
+COSYV_VENV_MARKER = ".youdub_venv_ready"
+COSYV_VENV_PATH_JSON = "venv_python_path.json"
+COSYV_INFER_SCRIPT_NAME = "cosyv_infer.py"
+
 LIGHT_PIP_DEPS = [
     "yt-dlp>=2024.8.6",
     "faster-whisper>=1.0.3",
@@ -71,24 +101,11 @@ LIGHT_PIP_DEPS = [
 
 APT_PACKAGES = ["ffmpeg", "sox", "libsox-dev", "git-lfs"]
 
-# CosyVoice's upstream requirements.txt pins onnxruntime-gpu==1.18.0 (Linux)
-# and onnxruntime==1.18.0 (Win/mac). That exact version has no cp313 wheel
-# (it shipped May 2024, before Python 3.13 existed), and current Colab now
-# defaults to Python 3.13 — so the pin fails to resolve. We install
-# requirements.txt with onnxruntime* excluded, then separately install this
-# compatible range. Bump the upper bound here if a future CosyVoice release
-# requires it.
-#
-# CosyVoice only uses vanilla onnxruntime APIs (SessionOptions,
-# GraphOptimizationLevel.ORT_ENABLE_ALL, InferenceSession, session.run), so
-# 1.20+ is API-compatible. Confirmed against cosyvoice/utils/onnx.py and
-# cosyvoice/cli/frontend.py.
-ONNXRUNTIME_VERSION = ">=1.20.0,<1.26.0"
-
-# Name of the temp file we write a filtered copy of CosyVoice's
-# requirements.txt into (with onnxruntime* lines stripped out). Resolved
-# against the system temp dir so it works on both Colab (/tmp) and Windows.
-FILTERED_REQ_FILENAME = "youdub_cosyv_requirements_filtered.txt"
+# When a subprocess fails, _run() prints the last N characters of its merged
+# stdout/stderr so the real error is visible without a manual re-run. 3000
+# is enough to cover pip's full error message + a few dozen progress-bar
+# lines of context, without flooding the log on a 9.75 GB download.
+_FAILURE_OUTPUT_TAIL_CHARS = 3000
 
 
 # ---------------------------------------------------------------------------
@@ -101,22 +118,75 @@ def _log(stage: str, msg: str) -> None:
     print(f"[{stage}] {msg}", flush=True)
 
 
+def _print_failure_output(pretty_cmd: str, output: str) -> None:
+    """Print the tail of a failed subprocess's output so the user can see
+    the real error without re-running the command. Defensive against
+    UnicodeEncodeError so a single weird byte can't crash the script.
+    """
+    n = len(output)
+    if n == 0:
+        print(f"  >>> command failed with no captured output: {pretty_cmd}", flush=True)
+        return
+    if n > _FAILURE_OUTPUT_TAIL_CHARS:
+        skipped = n - _FAILURE_OUTPUT_TAIL_CHARS
+        header = (
+            f"  >>> command failed: {pretty_cmd}\n"
+            f"  >>> {n} bytes of output; showing last "
+            f"{_FAILURE_OUTPUT_TAIL_CHARS} (skipped {skipped})"
+        )
+        body = "...<truncated>...\n" + output[-_FAILURE_OUTPUT_TAIL_CHARS:]
+    else:
+        header = f"  >>> command failed: {pretty_cmd}\n  >>> {n} bytes of output:"
+        body = output
+    print(header, flush=True)
+    print("  ─── begin output ───", flush=True)
+    try:
+        print(body, end="" if body.endswith("\n") else "\n", flush=True)
+    except UnicodeEncodeError:
+        # Some Colab sessions have a non-UTF stdout codec. Encode manually
+        # with 'replace' so we never crash the script just to print an
+        # error message about a different error.
+        sys.stdout.buffer.write(
+            (body + ("" if body.endswith("\n") else "\n")).encode(
+                sys.stdout.encoding or "utf-8", errors="replace"
+            )
+        )
+        sys.stdout.flush()
+    print("  ─── end output ───", flush=True)
+
+
 def _run(
     cmd: list[str], *, cwd: Optional[str] = None, check: bool = True
 ) -> subprocess.CompletedProcess:
-    """subprocess.run with a printed command, captured stderr on failure."""
+    """subprocess.run with a printed command and self-diagnosing failures.
+
+    On non-zero exit with check=True, prints the last
+    _FAILURE_OUTPUT_TAIL_CHARS of the captured output (stdout merged with
+    stderr) before re-raising CalledProcessError, so the real error is
+    visible directly in the script's log.
+    """
     pretty = " ".join(cmd) if isinstance(cmd, list) else cmd
     if cwd:
         pretty = f"(cwd={cwd}) {pretty}"
     print(f"  $ {pretty}", flush=True)
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        check=check,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=check,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except subprocess.CalledProcessError as e:
+        # e.output is the merged stdout+stderr (because we used STDOUT above)
+        # when text=True is set; on older Python or non-text mode, fall back
+        # to e.output.decode best-effort.
+        output = e.output or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        _print_failure_output(pretty, output)
+        raise
 
 
 def _which(binary: str) -> Optional[str]:
@@ -169,6 +239,11 @@ def stage_paths(args: argparse.Namespace) -> dict[str, str]:
     cosy_model = os.path.join(
         cosy_repo, "pretrained_models", DEFAULT_COSYVOICE_MODEL_DIR_NAME
     )
+    cosy_venv_dir = os.path.join(drive_root, COSYV_VENV_DIRNAME)
+    # The venv's python path is only known after stage_create_cosy_venv
+    # runs, so we leave it as a placeholder here and let that stage update
+    # the env file with the real path.
+    cosy_venv_python = os.path.join(cosy_venv_dir, "bin", "python")
     ollama_host = (
         args.ollama_host or os.environ.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST
     )
@@ -177,6 +252,8 @@ def stage_paths(args: argparse.Namespace) -> dict[str, str]:
         "DRIVE_ROOT": drive_root,
         "COSYVOICE_REPO_DIR": cosy_repo,
         "COSYVOICE_MODEL_DIR": cosy_model,
+        "COSYV_VENV_DIR": cosy_venv_dir,
+        "COSYV_VENV_PYTHON": cosy_venv_python,
         "OLLAMA_HOST": ollama_host,
         "YOUDUB_HF_MODEL_ID": args.hf_model_id,
     }
@@ -193,27 +270,152 @@ def stage_paths(args: argparse.Namespace) -> dict[str, str]:
     for k, v in env_vars.items():
         lines.append(f'export {k}="{v}"')
     env_sh_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    _log("1/7 paths", f"DRIVE_ROOT={drive_root}")
-    _log("1/7 paths", f"COSYVOICE_REPO_DIR={cosy_repo}")
-    _log("1/7 paths", f"COSYVOICE_MODEL_DIR={cosy_model}")
-    _log("1/7 paths", f"OLLAMA_HOST={ollama_host}")
-    _log("1/7 paths", f"wrote {env_sh_path}")
+    _log("1/8 paths", f"DRIVE_ROOT={drive_root}")
+    _log("1/8 paths", f"COSYVOICE_REPO_DIR={cosy_repo}")
+    _log("1/8 paths", f"COSYVOICE_MODEL_DIR={cosy_model}")
+    _log(
+        "1/8 paths", f"COSYV_VENV_PYTHON={cosy_venv_python} (will exist after Stage 2)"
+    )
+    _log("1/8 paths", f"OLLAMA_HOST={ollama_host}")
+    _log("1/8 paths", f"wrote {env_sh_path}")
     return env_vars
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: system deps
+# Stage 2: apt-install Python 3.11 + create the venv on Drive
+# ---------------------------------------------------------------------------
+
+
+def _apt_install_python311() -> Optional[str]:
+    """apt-install python3.11 + python3.11-venv + python3.11-dev. Returns
+    the path to the python3.11 binary (e.g. /usr/bin/python3.11) on
+    success, or None on failure.
+
+    Tries three strategies in order:
+      1. apt-get install python3.11  (works on Colab Ubuntu 22.04 as of 2025)
+      2. install software-properties-common, add deadsnakes PPA, retry
+      3. give up and return None
+    """
+    use_sudo = _which("sudo") is not None and not _is_root()
+    apt = ["sudo"] if use_sudo else []
+
+    candidates = [
+        f"python{PY311_VERSION}",
+        f"python{PY311_VERSION}-venv",
+        f"python{PY311_VERSION}-dev",
+    ]
+
+    def _have(exe: str) -> bool:
+        return _which(exe) is not None
+
+    # Strategy 1: direct apt install
+    if not _have(candidates[0]):
+        _log("2/8 venv", f"trying apt install {candidates}")
+        try:
+            _run([*apt, "apt-get", "update", "-qq"])
+            _run([*apt, "apt-get", "install", "-y", "-qq", *candidates])
+        except Exception as e:
+            _log("2/8 venv", f"direct apt install failed: {e!r}")
+        else:
+            if _have(candidates[0]):
+                _log("2/8 venv", f"apt install OK; {candidates[0]} now on PATH")
+                return _which(candidates[0])
+
+    # Strategy 2: deadsnakes PPA
+    if not _have(candidates[0]):
+        _log("2/8 venv", "Python 3.11 not on PATH; trying deadsnakes PPA")
+        try:
+            _run(
+                [*apt, "apt-get", "install", "-y", "-qq", "software-properties-common"]
+            )
+            _run([*apt, "add-apt-repository", "-y", "ppa:deadsnakes/ppa"])
+            _run([*apt, "apt-get", "update", "-qq"])
+            _run([*apt, "apt-get", "install", "-y", "-qq", *candidates])
+        except Exception as e:
+            _log("2/8 venv", f"deadsnakes PPA path failed: {e!r}")
+            return None
+        if _have(candidates[0]):
+            _log("2/8 venv", f"deadsnakes OK; {candidates[0]} now on PATH")
+            return _which(candidates[0])
+    return None if not _have(candidates[0]) else _which(candidates[0])
+
+
+def _venv_python_path(venv_dir: str) -> str:
+    """Return the absolute path to the venv's python interpreter."""
+    if sys.platform == "win32":
+        return os.path.join(venv_dir, "Scripts", "python.exe")
+    return os.path.join(venv_dir, "bin", "python")
+
+
+def stage_create_cosy_venv(args: argparse.Namespace) -> str:
+    """Stage 2: install Python 3.11 and create a venv on Drive.
+
+    Returns the absolute path to the venv's python interpreter. On a
+    warm re-run, this is a no-op (marker present, venv intact).
+    """
+    if args.skip_venv:
+        _log("2/8 venv", "skipped (--skip-venv)")
+        return os.environ["COSYV_VENV_PYTHON"]
+
+    venv_dir = os.environ["COSYV_VENV_DIR"]
+    marker = os.path.join(venv_dir, COSYV_VENV_MARKER)
+    py = _venv_python_path(venv_dir)
+    if os.path.isfile(marker) and os.path.isfile(py):
+        _log("2/8 venv", f"marker present + python exists at {py}; skipping")
+        os.environ["COSYV_VENV_PYTHON"] = py
+        return py
+
+    Path(venv_dir).mkdir(parents=True, exist_ok=True)
+
+    py311 = _apt_install_python311()
+    if not py311:
+        raise RuntimeError(
+            f"Could not install Python {PY311_VERSION} via apt. See the log "
+            f"above for which strategy failed. On Colab, this usually means "
+            f"the base image is older than expected or the deadsnakes PPA "
+            f"could not be reached. Try `Runtime -> Factory reset runtime` "
+            f"and re-run, or check your network."
+        )
+
+    if not os.path.isfile(py):
+        _log("2/8 venv", f"creating venv at {venv_dir} (one-time, ~30s)")
+        _run([py311, "-m", "venv", venv_dir])
+
+    if not os.path.isfile(py):
+        raise RuntimeError(f"venv creation reported success but {py} is missing")
+
+    # Sanity: venv's python must report the right version.
+    out = subprocess.run([py, "--version"], capture_output=True, text=True)
+    if PY311_VERSION not in out.stdout + out.stderr:
+        raise RuntimeError(
+            f"venv python at {py} reports unexpected version: "
+            f"{out.stdout.strip()!r} / {out.stderr.strip()!r}"
+        )
+    _log("2/8 venv", f"venv python OK: {out.stdout.strip()}")
+
+    Path(marker).write_text(
+        f"Created by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n"
+        f"python={py}\n",
+        encoding="utf-8",
+    )
+    os.environ["COSYV_VENV_PYTHON"] = py
+    _log("2/8 venv", f"wrote marker {marker}")
+    return py
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: system deps
 # ---------------------------------------------------------------------------
 
 
 def stage_system_deps(args: argparse.Namespace) -> None:
     if args.skip_system_deps:
-        _log("2/7 system-deps", "skipped (--skip-system-deps)")
+        _log("3/8 system-deps", "skipped (--skip-system-deps)")
         return
     if all(_which(p) for p in ["ffmpeg", "sox", "git-lfs"]):
-        _log("2/7 system-deps", "ffmpeg, sox, git-lfs already present; skipping")
+        _log("3/8 system-deps", "ffmpeg, sox, git-lfs already present; skipping")
         return
-    _log("2/7 system-deps", "apt-get update + install ffmpeg, sox, libsox-dev, git-lfs")
+    _log("3/8 system-deps", "apt-get update + install ffmpeg, sox, libsox-dev, git-lfs")
     subprocess.run(
         ["sudo", "-n", "true"], check=False, capture_output=True
     )  # noop, may fail
@@ -226,41 +428,41 @@ def stage_system_deps(args: argparse.Namespace) -> None:
     _run(["git", "lfs", "install"])
     # Print the ffmpeg version for the log.
     out = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-    _log("2/7 system-deps", out.stdout.splitlines()[0])
+    _log("3/8 system-deps", out.stdout.splitlines()[0])
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: light Python deps
+# Stage 4: light Python deps (main env, NOT the venv)
 # ---------------------------------------------------------------------------
 
 
 def stage_pip_light(args: argparse.Namespace) -> None:
     if args.skip_pip:
-        _log("3/7 pip-light", "skipped (--skip-pip)")
+        _log("4/8 pip-light", "skipped (--skip-pip)")
         return
     missing = [
         p for p in LIGHT_PIP_DEPS if not _pip_installed(p.split(">=")[0].split("==")[0])
     ]
     if not missing:
-        _log("3/7 pip-light", "all light deps already installed; skipping")
+        _log("4/8 pip-light", "all light deps already installed; skipping")
         return
-    _log("3/7 pip-light", f"installing {len(missing)} missing deps")
+    _log("4/8 pip-light", f"installing {len(missing)} missing deps")
     _run([sys.executable, "-m", "pip", "install", "-q", "-U", *missing])
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: clone or update CosyVoice
+# Stage 5: clone or update CosyVoice
 # ---------------------------------------------------------------------------
 
 
 def stage_clone_cosyvoice(args: argparse.Namespace) -> str:
     if args.skip_clone:
-        _log("4/7 clone", "skipped (--skip-clone)")
+        _log("5/8 clone", "skipped (--skip-clone)")
         return os.environ["COSYVOICE_REPO_DIR"]
     repo = os.environ["COSYVOICE_REPO_DIR"]
     if not os.path.isdir(repo):
         _log(
-            "4/7 clone",
+            "5/8 clone",
             f"cloning {DEFAULT_COSYVOICE_REPO_URL} -> {repo} (one-time, ~1 min)",
         )
         os.makedirs(os.path.dirname(repo), exist_ok=True)
@@ -276,13 +478,13 @@ def stage_clone_cosyvoice(args: argparse.Namespace) -> str:
             ]
         )
     else:
-        _log("4/7 clone", f"{repo} already exists; pulling + updating submodules")
+        _log("5/8 clone", f"{repo} already exists; pulling + updating submodules")
         # Don't blow up on a failed pull (e.g. transient network) — the repo
         # is still usable if the previous clone succeeded.
         try:
             _run(["git", "-C", repo, "pull", "--recurse-submodules"], check=False)
         except Exception as e:
-            _log("4/7 clone", f"pull failed (non-fatal): {e}")
+            _log("5/8 clone", f"pull failed (non-fatal): {e}")
     # Always run submodule update to recover from a partial previous clone.
     _run(["git", "-C", repo, "submodule", "update", "--init", "--recursive"])
     matcha = os.path.join(repo, "third_party", "Matcha-TTS")
@@ -290,25 +492,25 @@ def stage_clone_cosyvoice(args: argparse.Namespace) -> str:
         raise RuntimeError(
             f"Matcha-TTS submodule missing at {matcha}. Check the clone step above."
         )
-    _log("4/7 clone", "Matcha-TTS present")
+    _log("5/8 clone", "Matcha-TTS present")
     return repo
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: download CosyVoice3 weights
+# Stage 6: download CosyVoice3 weights
 # ---------------------------------------------------------------------------
 
 
 def stage_download_weights(args: argparse.Namespace) -> str:
     if args.skip_weights:
-        _log("5/7 weights", "skipped (--skip-weights)")
+        _log("6/8 weights", "skipped (--skip-weights)")
         return os.environ["COSYVOICE_MODEL_DIR"]
     model_dir = os.environ["COSYVOICE_MODEL_DIR"]
     marker = os.path.join(model_dir, "cosyvoice3.yaml")
     if os.path.isdir(model_dir) and os.path.isfile(marker):
-        _log("5/7 weights", f"cosyvoice3.yaml already present at {model_dir}; skipping")
+        _log("6/8 weights", f"cosyvoice3.yaml already present at {model_dir}; skipping")
         return model_dir
-    _log("5/7 weights", f"snapshot_download {args.hf_model_id} -> {model_dir}")
+    _log("6/8 weights", f"snapshot_download {args.hf_model_id} -> {model_dir}")
     from huggingface_hub import snapshot_download
 
     snapshot_download(
@@ -320,173 +522,76 @@ def stage_download_weights(args: argparse.Namespace) -> str:
         raise RuntimeError(
             f"Downloaded weights but {marker} is still missing. Check the HF repo id."
         )
-    _log("5/7 weights", "download complete")
+    _log("6/8 weights", "download complete")
     # Report size.
     out = subprocess.run(["du", "-sh", model_dir], capture_output=True, text=True)
     if out.stdout.strip():
-        _log("5/7 weights", f"on-disk size: {out.stdout.split()[0]}")
+        _log("6/8 weights", f"on-disk size: {out.stdout.split()[0]}")
     return model_dir
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: install CosyVoice's pinned requirements
+# Stage 7: install CosyVoice's pinned requirements into the venv
 # ---------------------------------------------------------------------------
-
-COSYV_DEPS_MARKER = ".youdub_cosyv_deps_installed"
-
-
-def _onnxruntime_pkg_name() -> str:
-    """Return `onnxruntime-gpu` on Linux, `onnxruntime` (CPU) elsewhere.
-
-    Mirrors the sys_platform markers in CosyVoice's requirements.txt.
-    """
-    return "onnxruntime-gpu" if sys.platform.startswith("linux") else "onnxruntime"
-
-
-def _filter_requirements_txt(text: str) -> tuple[list[str], list[str]]:
-    """Return (kept_lines, dropped_lines) for a requirements.txt body.
-
-    Drops any line whose first non-whitespace token starts with
-    `onnxruntime` — covers both `onnxruntime==1.18.0` and
-    `onnxruntime-gpu==1.18.0; sys_platform == 'linux'`, with or without
-    inline comments. Does NOT drop `onnx==...` (the ONNX format library,
-    which is a different package).
-
-    Preserves the original line text verbatim (including leading
-    whitespace and inline comments) on the kept side. Blank lines and
-    pure-comment lines are passed through unchanged.
-    """
-    kept: list[str] = []
-    dropped: list[str] = []
-    for raw_line in text.splitlines():
-        # Preserve blank lines and pure comments.
-        stripped = raw_line.lstrip()
-        if not stripped or stripped.startswith("#"):
-            kept.append(raw_line)
-            continue
-        # Take the first whitespace-delimited token; that's the package name.
-        first_token = stripped.split()[0]
-        # Strip any inline env-marker ("; sys_platform == 'linux'") from
-        # the package name for the comparison — pip's marker syntax can
-        # appear directly after the name with no space.
-        pkg_name = first_token.split(";", 1)[0].strip()
-        if pkg_name.startswith("onnxruntime"):
-            dropped.append(raw_line)
-        else:
-            kept.append(raw_line)
-    return kept, dropped
 
 
 def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
+    """Install CosyVoice's ORIGINAL, UNMODIFIED requirements.txt into the
+    Py3.11 venv. No filtering or relaxing is needed because the venv
+    has full wheel support for CosyVoice's pinned versions.
+    """
     if args.skip_cosyv_deps:
-        _log("6/7 cosyv-deps", "skipped (--skip-cosyv-deps)")
+        _log("7/8 cosyv-deps", "skipped (--skip-cosyv-deps)")
         return
-    marker = os.path.join(repo, COSYV_DEPS_MARKER)
+    py = os.environ["COSYV_VENV_PYTHON"]
+    if not os.path.isfile(py):
+        raise RuntimeError(
+            f"venv python not found at {py}. Did Stage 2 (venv creation) succeed?"
+        )
+
+    # Marker lives in the venv (not in the CosyVoice repo) so it's wiped
+    # only if the user nukes the venv on purpose.
+    marker = os.path.join(os.environ["COSYV_VENV_DIR"], COSYV_VENV_MARKER + ".deps")
     if os.path.isfile(marker):
-        _log("6/7 cosyv-deps", f"marker {marker} present; skipping")
+        _log("7/8 cosyv-deps", f"marker {marker} present; skipping")
         return
+
     req = os.path.join(repo, "requirements.txt")
     if not os.path.isfile(req):
         raise RuntimeError(f"CosyVoice requirements.txt missing at {req}")
 
-    ort_pkg = _onnxruntime_pkg_name()
-
-    # Pass 1: install requirements.txt with onnxruntime* lines filtered out.
-    # CosyVoice's pinned ort==1.18.0 has no cp313 wheel, so resolving
-    # requirements.txt as-written fails on Colab's Python 3.13 default.
-    # We don't edit the upstream requirements.txt (it lives in a cloned
-    # repo and would be wiped on re-clone) — we write a filtered copy
-    # of the file to a temp path and install from that, then install a
-    # compatible onnxruntime range separately below.
-    #
-    # We do NOT use `pip install --exclude` here because that flag is
-    # not valid for `pip install` (only for `pip download` / `pip list`)
-    # and would exit 2 with `no such option: --exclude`.
-    with open(req, encoding="utf-8") as f:
-        original_text = f.read()
-    kept_lines, dropped_lines = _filter_requirements_txt(original_text)
-    if dropped_lines:
-        for line in dropped_lines:
-            _log("6/7 cosyv-deps", f"  filtering: {line.strip()}")
-    else:
-        _log(
-            "6/7 cosyv-deps",
-            "  warning: no onnxruntime* lines found in requirements.txt; "
-            "filter was a no-op",
-        )
-
-    filtered_path = os.path.join(tempfile.gettempdir(), FILTERED_REQ_FILENAME)
-    Path(filtered_path).write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
-    _log("6/7 cosyv-deps", f"wrote filtered requirements -> {filtered_path}")
-    _log("6/7 cosyv-deps", f"pip install -r {filtered_path} (2-3 min)")
-
-    install_failed = False
-    try:
-        _run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-q",
-                "-r",
-                filtered_path,
-            ],
-            cwd=repo,  # kept in case any future requirements.txt uses relative paths
-        )
-    except BaseException:
-        # Mark for retention, then re-raise so the outer stage still
-        # surfaces the failure to run_pipeline.
-        install_failed = True
-        raise
-    finally:
-        # Best-effort cleanup of the temp file on success. If the install
-        # raised, leave the file in place so the user can inspect it.
-        if not install_failed:
-            try:
-                if os.path.isfile(filtered_path):
-                    os.unlink(filtered_path)
-            except OSError:
-                pass
-
-    # Pass 2: install the compatible onnxruntime range.
-    ort_spec = f"{ort_pkg}{ONNXRUNTIME_VERSION}"
-    _log("6/7 cosyv-deps", f"pip install {ort_spec} (1 min)")
-    _run([sys.executable, "-m", "pip", "install", "-q", ort_spec], cwd=repo)
-
-    # Report the actual version installed, so the log shows what we got.
-    show = _run(
-        [sys.executable, "-m", "pip", "show", ort_pkg],
-        check=False,
-        cwd=repo,
-    )
-    installed_version = "(unknown)"
-    for line in show.stdout.splitlines():
-        if line.startswith("Version:"):
-            installed_version = line.split(":", 1)[1].strip()
-            break
-    _log("6/7 cosyv-deps", f"installed {ort_pkg}=={installed_version}")
+    _log("7/8 cosyv-deps", f"pip install -r {req} (via venv python, 5-10 min)")
+    _run([py, "-m", "pip", "install", "-q", "-U", "-r", req], cwd=repo)
 
     Path(marker).write_text(
         f"Installed by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n"
-        f"{ort_pkg}=={installed_version}\n",
+        f"requirements={req}\n",
         encoding="utf-8",
     )
-    _log("6/7 cosyv-deps", f"wrote marker {marker}")
+    _log("7/8 cosyv-deps", f"wrote marker {marker}")
 
 
 # ---------------------------------------------------------------------------
-# Stage 7: AutoModel import sanity check
+# Stage 8: AutoModel import sanity check (via the venv's python)
 # ---------------------------------------------------------------------------
 
 
 def stage_sanity_check(args: argparse.Namespace) -> None:
+    """Run `from cosyvoice.cli.cosyvoice import AutoModel` in the venv's
+    python. On success, write venv_python_path.json so pipeline.py can
+    discover the interpreter without re-running the setup script.
+    """
     if args.skip_cosyv_deps:
-        _log("7/7 sanity", "skipped (--skip-cosyv-deps)")
+        _log("8/8 sanity", "skipped (--skip-cosyv-deps)")
         return
+    py = os.environ["COSYV_VENV_PYTHON"]
+    if not os.path.isfile(py):
+        raise RuntimeError(
+            f"venv python not found at {py}. Did Stage 2 (venv creation) succeed?"
+        )
     repo = os.environ["COSYVOICE_REPO_DIR"]
     matcha = os.path.join(repo, "third_party", "Matcha-TTS")
-    _log("7/7 sanity", "importing AutoModel from cloned CosyVoice")
+    _log("8/8 sanity", f"importing AutoModel via venv python {py}")
     code = (
         "import sys; "
         f"sys.path.insert(0, {repo!r}); "
@@ -494,18 +599,42 @@ def stage_sanity_check(args: argparse.Namespace) -> None:
         "from cosyvoice.cli.cosyvoice import AutoModel; "
         "print('AutoModel import OK')"
     )
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-    if r.returncode != 0:
-        print(r.stdout, end="")
-        print(r.stderr, end="", file=sys.stderr)
-        _log(
-            "7/7 sanity", "FAILED. Most common cause: onnxruntime/numpy version drift."
-        )
-        _log("7/7 sanity", "Fix: in the CosyVoice dir, run:")
-        _log("7/7 sanity", "  pip install -U onnxruntime numpy==1.26.4")
-        raise RuntimeError("AutoModel import failed; see hints above.")
+    # Use _run(check=False) so the failure path goes through our standard
+    # tail-of-output printer, then raise ourselves so the user still gets
+    # a clear "this is a sanity-check failure" error.
+    r = _run([py, "-c", code], check=False)
     print(r.stdout, end="")
-    _log("7/7 sanity", "OK")
+    if r.returncode != 0:
+        _log(
+            "8/8 sanity",
+            "FAILED. Common causes:",
+        )
+        _log("8/8 sanity", "  - venv pip install didn't complete (re-run Stage 7)")
+        _log("8/8 sanity", "  - missing Matcha-TTS submodule (re-run Stage 5)")
+        _log("8/8 sanity", "  - disk full (check Drive quota)")
+        raise RuntimeError("AutoModel import failed; see hints above.")
+
+    # Write the discovery JSON so pipeline.py can find this venv without
+    # running colab_setup.py first.
+    venv_dir = os.environ["COSYV_VENV_DIR"]
+    json_path = os.path.join(venv_dir, COSYV_VENV_PATH_JSON)
+    import json as _json
+
+    Path(json_path).write_text(
+        _json.dumps(
+            {
+                "venv_dir": venv_dir,
+                "venv_python": py,
+                "model_dir": os.environ["COSYVOICE_MODEL_DIR"],
+                "cosyvoice_repo": repo,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _log("8/8 sanity", f"wrote discovery file {json_path}")
+    _log("8/8 sanity", "OK")
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +666,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Git branch of FunAudioLLM/CosyVoice to checkout.",
     )
     p.add_argument(
+        "--skip-venv",
+        action="store_true",
+        help="Skip Python 3.11 venv creation/refresh (Stage 2).",
+    )
+    p.add_argument(
         "--skip-system-deps",
         action="store_true",
         help="Skip apt-get install (ffmpeg, sox, git-lfs).",
@@ -566,11 +700,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("=" * 60)
 
     env = stage_paths(args)
-    repo = os.environ["COSYVOICE_REPO_DIR"]
+    venv_python = stage_create_cosy_venv(args)
+    # Update COSYV_VENV_PYTHON in the env file now that the venv exists.
+    env["COSYV_VENV_PYTHON"] = venv_python
+    env_sh_path = Path(__file__).resolve().parent / "colab_env.sh"
+    lines = [
+        "#!/usr/bin/env bash",
+        "# Auto-generated by scripts/colab_setup.py — do not edit by hand.",
+        "# Re-run colab_setup.py to refresh.",
+    ]
+    for k, v in env.items():
+        lines.append(f'export {k}="{v}"')
+    env_sh_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     stage_system_deps(args)
     stage_pip_light(args)
-    stage_clone_cosyvoice(args)
+    repo = stage_clone_cosyvoice(args)
     stage_download_weights(args)
     stage_install_cosyv_deps(args, repo)
     stage_sanity_check(args)
@@ -583,7 +728,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"  {k}={v}")
     print()
     print("To make these env vars visible to subsequent Colab cells, run:")
-    print(f"    !source {Path(__file__).resolve().parent / 'colab_env.sh'}")
+    print(f"    !source {env_sh_path}")
+    print()
+    print("Two-environment architecture is in place:")
+    print(
+        f"  - Main Colab kernel (Py{sys.version_info.major}.{sys.version_info.minor}):"
+    )
+    print(f"      runs the pipeline orchestration + faster-whisper + Ollama + ffmpeg")
+    print(f"  - CosyVoice venv (Py{PY311_VERSION}): {venv_python}")
+    print(f"      runs the TTS model via scripts/{COSYV_INFER_SCRIPT_NAME}")
     print("=" * 60)
     return 0
 

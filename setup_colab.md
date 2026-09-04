@@ -4,11 +4,42 @@ This notebook is a **thin runner**. All actual setup logic lives in
 `scripts/colab_setup.py` in the repo, so fixes only need to happen in one
 place (the repo). Re-running cells is safe; the setup script is idempotent.
 
-Recommended runtime: **T4 GPU**, **High RAM**.
+Recommended runtime: **T4 GPU**, **High RAM**, **~15 GB free Drive space**.
 
-> **Deprecated:** The previous 11 inline setup cells are gone. If you're
-> following a tutorial or older doc that references them, ignore it — the
-> script is the source of truth. See `progress.md` → "## Infrastructure".
+---
+
+## Two-environment architecture
+
+The YouDub pipeline runs in **two separate Python environments** because
+Colab's default kernel (Python 3.13) has no wheel for CosyVoice3's exact
+pins (torch 2.3.1, numpy 1.26.4, onnxruntime-gpu 1.18.0,
+openai-whisper 20231117). Rather than relax pins (which risks Qwen2 model
+breakage) or pin Colab to Py3.12 (no UI option), the setup script isolates
+CosyVoice in its own Python 3.11 venv on Drive.
+
+| Environment | Python | Where | Used for |
+|---|---|---|---|
+| **Main Colab kernel** | 3.13 (Colab default) | The Colab notebook process | `pipeline.py` orchestration, faster-whisper, Ollama, ffmpeg, all 8 pipeline functions except TTS |
+| **CosyVoice venv** | 3.11 (apt-installed) | `$DRIVE_ROOT/cosyv_venv311` | CosyVoice's `AutoModel` + TTS inference via `scripts/cosyv_infer.py` subprocess |
+
+The two environments communicate over a newline-delimited JSON protocol on
+stdin/stdout. The main kernel spawns one long-running CosyVoice subprocess
+per `synthesize_dubbed_audio` call, sends one job per segment, and reads
+one result per segment. The 30-40 s model load is paid once and amortized
+across all segments.
+
+The venv lives on Drive so it persists across Colab reconnects. You only
+pay the install cost once per Drive account.
+
+---
+
+> **Deprecated:** The previous 11 inline setup cells are gone. The
+> previous "filter onnxruntime / openai-whisper in the main env" approach
+> is also gone — it was a workaround for a Python 3.13 compatibility
+> problem that the venv approach solves cleanly. If you're following a
+> tutorial or older doc that references them, ignore it — the script and
+> the venv are the source of truth. See `progress.md` → "## Python 3.13
+> compatibility" for the full history.
 
 ---
 
@@ -36,9 +67,13 @@ print(subprocess.check_output(["git", "-C", PROJ, "log", "-1", "--oneline"],
 
 ## Cell 2 — Run the setup script
 
-This single call handles: ffmpeg install, light pip deps, CosyVoice clone,
-weights download, CosyVoice pinned requirements, and an AutoModel import
-sanity check. Re-running skips anything already done.
+This single call handles: **apt-install Python 3.11 + create the venv on
+Drive**, ffmpeg install, light pip deps, CosyVoice clone, weights download,
+CosyVoice pinned requirements (installed unmodified into the venv), and an
+AutoModel import sanity check via the venv's python.
+
+First-time run: ~10-15 minutes (mostly pip install of torch 2.3.1 and the
+rest of CosyVoice's pinned deps). Warm re-runs: a few seconds.
 
 ```python
 !python "{PROJ}/scripts/colab_setup.py"
@@ -49,15 +84,19 @@ sanity check. Re-running skips anything already done.
 ## Cell 3 — Make the env vars visible to subsequent Colab cells
 
 The setup script writes `scripts/colab_env.sh`; `source` it to inherit the
-exported variables (Drive path, CosyVoice repo, model dir, Ollama host) in
-this Colab Python process.
+exported variables (Drive path, CosyVoice repo, model dir, venv path, Ollama
+host) in this Colab Python process.
 
 ```python
 !source "{PROJ}/scripts/colab_env.sh"
 import os
-for k in ("DRIVE_ROOT", "COSYVOICE_REPO_DIR", "COSYVOICE_MODEL_DIR", "OLLAMA_HOST"):
+for k in ("DRIVE_ROOT", "COSYVOICE_REPO_DIR", "COSYVOICE_MODEL_DIR",
+          "COSYV_VENV_PYTHON", "OLLAMA_HOST"):
     print(f"  {k}={os.environ.get(k)}")
 ```
+
+If `COSYV_VENV_PYTHON` is empty or points to a missing file, the venv
+wasn't created properly — re-run Cell 2.
 
 ---
 
@@ -98,9 +137,10 @@ ollama.pull(os.environ.get("OLLAMA_MODEL", "llama3.1:8b"))
 ```python
 import os, sys
 PROJ = os.environ["DRIVE_ROOT"]
-for p in (PROJ,
-          os.environ["COSYVOICE_REPO_DIR"],
-          os.path.join(os.environ["COSYVOICE_REPO_DIR"], "third_party", "Matcha-TTS")):
+# NOTE: we do NOT add COSYVOICE_REPO_DIR to sys.path in the main process
+# anymore. CosyVoice now runs in a separate subprocess (the venv), so the
+# main kernel never imports it. Only the venv's python sees CosyVoice.
+for p in (PROJ,):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -155,21 +195,35 @@ if orig:
 # Free GPU memory between long runs
 import torch, gc
 gc.collect(); torch.cuda.empty_cache()
+# Optionally stop the CosyVoice subprocess if one is still running
+import pipeline
+pipeline.reset_models()
 ```
 
 ---
 
 ## Troubleshooting
 
-- **"AutoModel import OK" never prints.** Usually an onnxruntime / numpy
-  version drift. From the CosyVoice dir:
-  `pip install -U onnxruntime numpy==1.26.4`
+- **"AutoModel import OK" never prints (Stage 8).** The venv's `pip install
+  -r requirements.txt` (Stage 7) didn't complete, the Matcha-TTS submodule
+  is missing, or Drive is out of space. Re-run Cell 2; check the stage
+  output for which sub-step failed.
+- **Stage 2 ("venv") failed: "Could not install Python 3.11 via apt."**
+  Colab's base image may not have python3.11 in main repos, and the
+  deadsnakes PPA add may have been blocked. Try
+  `Runtime → Factory reset runtime` and re-run, or check your network.
 - **`snapshot_download` raises 401 / RepositoryNotFoundError.** The HF
   repo id may have changed. Pass `--hf-model-id` to the setup script with
   a working id, and update `scripts/colab_setup.py` → `DEFAULT_HF_MODEL_ID`.
 - **Ollama cell 4 hangs on `curl https://ollama.com/install.sh`.** You're
   probably on a restricted network. Skip local Ollama and set
   `OLLAMA_HOST` in `scripts/colab_env.sh` instead.
+- **`pipeline.run_pipeline` raises `PipelineError("CosyVoice venv discovery
+  file not found...")`.** Re-run Cell 2 to regenerate the discovery file.
+- **CosyVoice subprocess keeps dying mid-run.** Check Colab's `/tmp` and
+  the venv directory for disk space; GPU OOM leaves a hint in the
+  subprocess's stderr (drained by `pipeline.py` and included in the error
+  message).
 - **Setup script did 5 GB of work but my fix wasn't picked up.** You
   probably forgot to re-run Cell 1 (`git pull`). Re-run cells in order
   1 → 2 → 3 → 5.

@@ -87,6 +87,20 @@ HF_MODEL_ID = os.environ.get(
     "YOUDUB_HF_MODEL_ID", "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 )
 
+# Path to the CosyVoice3 inference driver. Run inside the Python 3.11 venv
+# (see scripts/colab_setup.py). We shell out to it for each segment.
+COSYV_INFER_SCRIPT = os.environ.get(
+    "COSYV_INFER_SCRIPT",
+    str(Path(__file__).resolve().parent / "scripts" / "cosyv_infer.py"),
+)
+
+# Name of the JSON file stage_sanity_check writes inside the venv directory.
+# pipeline.py reads it to discover the venv's python interpreter without
+# having to re-run the setup script. Override via env var for tests.
+COSYV_VENV_PATH_JSON = os.environ.get(
+    "COSYV_VENV_PATH_JSON_FILENAME", "venv_python_path.json"
+)
+
 
 # ----------------------------------------------------------------------------
 # Lazy model singletons
@@ -94,24 +108,6 @@ HF_MODEL_ID = os.environ.get(
 # Pattern: each `_get_X()` returns the cached object, building it on first
 # call. The `reset_models()` helper is provided for tests that need a clean
 # state.
-
-
-def _add_cosyvoice_to_path() -> str:
-    """Put the CosyVoice repo + Matcha-TTS submodule on sys.path.
-    Idempotent. Returns the cosyvoice repo dir (handy for error messages).
-    """
-    repo = Path(COSYVOICE_REPO_DIR)
-    if not repo.is_dir():
-        raise PipelineError(
-            f"CosyVoice repo not found at {repo}. Run the Colab setup cell "
-            f"that does `git clone --recursive https://github.com/"
-            f"FunAudioLLM/CosyVoice.git {repo}` first."
-        )
-    matcha = repo / "third_party" / "Matcha-TTS"
-    for p in (str(repo), str(matcha)):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    return str(repo)
 
 
 _WHISPER_MODEL = None
@@ -146,24 +142,179 @@ def _get_whisper(model_size: str, device: str, compute_type: str):
     return _WHISPER_MODEL
 
 
-_COSYVOICE_MODEL = None
-_COSYVOICE_MODEL_DIR = None
+# CosyVoice runs in a separate Python 3.11 subprocess. The main process
+# (this one) never imports `cosyvoice` or `torchaudio`. We cache the
+# subprocess handle in a module-level variable so all segments share one
+# model load (~30-40s amortized across the whole run).
+_COSYV_PROC: Optional[subprocess.Popen] = None
+_COSYV_MODEL_DIR: Optional[str] = None
+_COSYV_REF_AUDIO: Optional[str] = None
+_COSYV_VENV_INFO: Optional[dict] = None
 
 
-def _get_cosyvoice(model_dir: str):
-    """Return a cached `cosyvoice.cli.cosyvoice.AutoModel`. Slow on first call
-    (~30-40 s for CosyVoice3-0.5B) so we cache aggressively."""
-    global _COSYVOICE_MODEL, _COSYVOICE_MODEL_DIR
-    if _COSYVOICE_MODEL is not None and _COSYVOICE_MODEL_DIR == model_dir:
-        return _COSYVOICE_MODEL
-    _add_cosyvoice_to_path()
-    from cosyvoice.cli.cosyvoice import AutoModel  # type: ignore  # noqa: E402
+def _find_cosy_venv() -> dict:
+    """Locate the CosyVoice venv's python interpreter. Reads the JSON
+    discovery file that stage_sanity_check wrote.
 
-    log.info("Loading CosyVoice model from %s (first call is slow)...", model_dir)
-    _COSYVOICE_MODEL = AutoModel(model_dir=model_dir)
-    _COSYVOICE_MODEL_DIR = model_dir
-    log.info("CosyVoice loaded. sample_rate=%s", _COSYVOICE_MODEL.sample_rate)
-    return _COSYVOICE_MODEL
+    Returns a dict with keys: venv_dir, venv_python, model_dir,
+    cosyvoice_repo. Raises PipelineError with a clear remediation message
+    if the file is missing.
+    """
+    global _COSYV_VENV_INFO
+    if _COSYV_VENV_INFO is not None:
+        return _COSYV_VENV_INFO
+
+    # Search locations, in priority order. The first one that exists wins.
+    venv_dir = os.environ.get("COSYV_VENV_DIR", "")
+    candidates = []
+    if venv_dir:
+        candidates.append(os.path.join(venv_dir, COSYV_VENV_PATH_JSON))
+    drive_root = os.environ.get("DRIVE_ROOT", "")
+    if drive_root:
+        candidates.append(
+            os.path.join(drive_root, "cosyv_venv311", COSYV_VENV_PATH_JSON)
+        )
+    # Fall back to the default Drive location.
+    candidates.append(
+        os.path.join(
+            "/content/drive/MyDrive/YouDub", "cosyv_venv311", COSYV_VENV_PATH_JSON
+        )
+    )
+
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    info = json.loads(f.read())
+            except (OSError, json.JSONDecodeError) as e:
+                raise PipelineError(
+                    f"Could not read venv discovery file at {path}: {e}. "
+                    f"Re-run scripts/colab_setup.py to regenerate it."
+                ) from e
+            py = info.get("venv_python", "")
+            if not py or not os.path.isfile(py):
+                raise PipelineError(
+                    f"venv discovery file at {path} points to a missing "
+                    f"python interpreter ({py!r}). The venv may have been "
+                    f"deleted; re-run scripts/colab_setup.py."
+                )
+            _COSYV_VENV_INFO = info
+            log.info(
+                "Discovered CosyVoice venv at %s (python=%s)", info.get("venv_dir"), py
+            )
+            return info
+
+    raise PipelineError(
+        "CosyVoice venv discovery file not found. Searched:\n  "
+        + "\n  ".join(candidates)
+        + "\n\nRun `python scripts/colab_setup.py` from the project root "
+        "to create the venv and write the discovery file. The setup script "
+        "is idempotent — re-running it is safe."
+    )
+
+
+def _start_cosyv_subprocess(model_dir: str, ref_audio: str) -> subprocess.Popen:
+    """Spawn the long-running CosyVoice inference subprocess.
+
+    The subprocess loads AutoModel on its first job and then accepts TTS
+    jobs over stdin/stdout (newline-delimited JSON). We send one job per
+    segment and read one response per segment.
+    """
+    info = _find_cosy_venv()
+    py = info["venv_python"]
+
+    cmd = [py, COSYV_INFER_SCRIPT, "--model-dir", model_dir, "--ref-audio", ref_audio]
+    log.info("Starting CosyVoice subprocess: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,  # line-buffered so JSON lines flow promptly
+        text=True,
+        encoding="utf-8",
+    )
+    return proc
+
+
+def _send_cosyv_job(
+    proc: subprocess.Popen, text: str, ref_audio: str, out_path: str
+) -> dict:
+    """Send one TTS job to the CosyVoice subprocess and read the response.
+
+    Raises RuntimeError on subprocess death or protocol error. The caller
+    decides whether to abort the run or respawn and retry.
+    """
+    job = json.dumps({"text": text, "ref_audio": ref_audio, "out_path": out_path})
+    assert proc.stdin is not None and proc.stdout is not None
+    try:
+        proc.stdin.write(job + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError) as e:
+        raise RuntimeError(
+            f"CosyVoice subprocess stdin closed while sending job: {e}"
+        ) from e
+
+    line = proc.stdout.readline()
+    if not line:
+        # Subprocess died (or closed stdout). Drain stderr for the cause.
+        stderr = ""
+        try:
+            if proc.stderr is not None:
+                stderr = proc.stderr.read() or ""
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"CosyVoice subprocess closed stdout unexpectedly. "
+            f"stderr (if any): {stderr[-1000:].strip()}"
+        )
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"CosyVoice subprocess sent malformed response: {line!r}"
+        ) from e
+
+
+def _stop_cosyv_subprocess(proc: Optional[subprocess.Popen]) -> None:
+    """Send the shutdown command and wait for the subprocess to exit.
+    Best-effort: if it doesn't exit within a short window, terminate.
+    """
+    if proc is None:
+        return
+    if proc.poll() is not None:
+        return  # already exited
+    try:
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.write(json.dumps({"_cmd": "shutdown"}) + "\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        log.warning("CosyVoice subprocess did not exit after shutdown; terminating")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def reset_models() -> None:
+    """Drop all cached model objects. Used by tests."""
+    global _WHISPER_MODEL, _WHISPER_MODEL_SIZE, _WHISPER_DEVICE, _WHISPER_COMPUTE_TYPE
+    global _COSYV_PROC, _COSYV_MODEL_DIR, _COSYV_REF_AUDIO, _COSYV_VENV_INFO
+    _WHISPER_MODEL = None
+    _WHISPER_MODEL_SIZE = None
+    _WHISPER_DEVICE = None
+    _WHISPER_COMPUTE_TYPE = None
+    _stop_cosyv_subprocess(_COSYV_PROC)
+    _COSYV_PROC = None
+    _COSYV_MODEL_DIR = None
+    _COSYV_REF_AUDIO = None
+    _COSYV_VENV_INFO = None
 
 
 def _get_ollama():
@@ -171,18 +322,6 @@ def _get_ollama():
     import ollama  # type: ignore
 
     return ollama.Client(host=OLLAMA_HOST)
-
-
-def reset_models() -> None:
-    """Drop all cached model objects. Used by tests."""
-    global _WHISPER_MODEL, _WHISPER_MODEL_SIZE, _WHISPER_DEVICE, _WHISPER_COMPUTE_TYPE
-    global _COSYVOICE_MODEL, _COSYVOICE_MODEL_DIR
-    _WHISPER_MODEL = None
-    _WHISPER_MODEL_SIZE = None
-    _WHISPER_DEVICE = None
-    _WHISPER_COMPUTE_TYPE = None
-    _COSYVOICE_MODEL = None
-    _COSYVOICE_MODEL_DIR = None
 
 
 # ----------------------------------------------------------------------------
@@ -649,16 +788,30 @@ def synthesize_dubbed_audio(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     model_dir = model_dir or COSYVOICE_MODEL_DIR
-    try:
-        cv = _get_cosyvoice(model_dir)
-    except PipelineError:
-        raise
-    except Exception as e:
-        raise PipelineError(
-            f"synthesize_dubbed_audio: failed to load CosyVoice from {model_dir}: {e}"
-        ) from e
 
-    import torchaudio  # type: ignore  # used by AutoModel.inference_* callers
+    # Lazily start the long-running CosyVoice subprocess. The subprocess
+    # loads AutoModel on its first job (~30-40s) and then accepts TTS
+    # jobs over stdin/stdout. We share the subprocess across all segments
+    # in this run so the model load cost is paid once.
+    global _COSYV_PROC, _COSYV_MODEL_DIR, _COSYV_REF_AUDIO
+    if (
+        _COSYV_PROC is None
+        or _COSYV_PROC.poll() is not None
+        or _COSYV_MODEL_DIR != model_dir
+        or _COSYV_REF_AUDIO != reference_voice_path
+    ):
+        # Subprocess missing, dead, or its inputs changed. Stop any old
+        # handle and start fresh.
+        _stop_cosyv_subprocess(_COSYV_PROC)
+        try:
+            _COSYV_PROC = _start_cosyv_subprocess(model_dir, reference_voice_path)
+        except FileNotFoundError as e:
+            raise PipelineError(
+                f"synthesize_dubbed_audio: could not start CosyVoice subprocess: {e}. "
+                f"Verify the venv was created (re-run scripts/colab_setup.py)."
+            ) from e
+        _COSYV_MODEL_DIR = model_dir
+        _COSYV_REF_AUDIO = reference_voice_path
 
     out: list[dict] = []
     for i, seg in enumerate(segments):
@@ -670,22 +823,9 @@ def synthesize_dubbed_audio(
             _write_silence_wav(seg_out_path, max(0.1, seg["end"] - seg["start"]))
             synth_dur = max(0.1, seg["end"] - seg["start"])
         else:
-            try:
-                synth_dur = _cosyvoice_synth_one(
-                    cv, text, reference_voice_path, seg_out_path
-                )
-            except Exception as e:
-                log.warning(
-                    "synthesize_dubbed_audio: seg %d failed (%s); retrying", i, e
-                )
-                try:
-                    synth_dur = _cosyvoice_synth_one(
-                        cv, text, reference_voice_path, seg_out_path
-                    )
-                except Exception as e2:
-                    raise RuntimeError(
-                        f"synthesize_dubbed_audio: seg {i} failed twice: {e2}"
-                    ) from e2
+            synth_dur = _synthesize_one_via_subprocess(
+                i, text, reference_voice_path, seg_out_path
+            )
 
         out.append(
             {
@@ -701,21 +841,50 @@ def synthesize_dubbed_audio(
     return out
 
 
-def _cosyvoice_synth_one(cv, text: str, ref_audio: str, out_path: str) -> float:
-    """Run a single CosyVoice3 cross-lingual inference and save the result.
-    Returns the duration of the saved clip in seconds."""
-    import torchaudio  # type: ignore
+def _synthesize_one_via_subprocess(
+    seg_index: int, text: str, ref_audio: str, out_path: str
+) -> float:
+    """Send one TTS job to the CosyVoice subprocess. On subprocess death,
+    respawn once and retry the same job. If the respawn also fails, raise.
 
-    # inference_cross_lingual returns a generator of dicts with `tts_speech`.
-    # In non-streaming mode there's exactly one chunk for short inputs.
-    for chunk in cv.inference_cross_lingual(
-        tts_text=text, prompt_audio=ref_audio, stream=False
-    ):
-        wav = chunk["tts_speech"]  # torch.Tensor, shape (1, samples)
-        torchaudio.save(out_path, wav.cpu(), cv.sample_rate)
-        samples = wav.shape[-1]
-        return float(samples) / float(cv.sample_rate)
-    raise RuntimeError("inference_cross_lingual yielded no chunks")
+    Returns the duration in seconds of the synthesized clip.
+    """
+    global _COSYV_PROC
+    result: Optional[dict] = None
+    for attempt in (1, 2):
+        assert _COSYV_PROC is not None
+        try:
+            result = _send_cosyv_job(_COSYV_PROC, text, ref_audio, out_path)
+            break
+        except Exception as e:
+            log.warning(
+                "synthesize_dubbed_audio: seg %d attempt %d failed (%s); %s",
+                seg_index,
+                attempt,
+                e,
+                "respawning subprocess" if attempt == 1 else "giving up",
+            )
+            if attempt == 2:
+                raise RuntimeError(
+                    f"synthesize_dubbed_audio: seg {seg_index} failed twice: {e}"
+                ) from e
+            _stop_cosyv_subprocess(_COSYV_PROC)
+            _COSYV_PROC = _start_cosyv_subprocess(
+                # We re-read from globals since _COSYV_MODEL_DIR/REF_AUDIO
+                # are the canonical "what we started with" values.
+                os.environ.get("COSYVOICE_MODEL_DIR", _COSYV_MODEL_DIR or ""),
+                ref_audio,
+            )
+    if result is None:
+        # Should be unreachable: the for-loop above either breaks with
+        # result set or raises. Defensive guard.
+        raise RuntimeError(
+            f"synthesize_dubbed_audio: seg {seg_index} produced no result"
+        )
+    if not result.get("ok"):
+        err = result.get("error", "unknown error")
+        raise RuntimeError(f"synthesize_dubbed_audio: seg {seg_index} failed: {err}")
+    return float(result.get("duration", 0.0))
 
 
 def _write_silence_wav(path: str, duration_sec: float) -> None:

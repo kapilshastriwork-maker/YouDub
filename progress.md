@@ -62,6 +62,80 @@ add a stage to `colab_setup.py` rather than another inline cell.
 
 ---
 
+## Python 3.13 compatibility
+
+Colab's default kernel is now Python 3.13. CosyVoice3's exact pins
+(`torch==2.3.1`, `numpy==1.26.4`, `onnxruntime-gpu==1.18.0`,
+`openai-whisper==20231117`) have no cp313 wheels and several have no
+sdist at all. We went through four approaches before landing on a clean
+solution. The first three are documented here as historical record; the
+fourth is the current architecture.
+
+| # | Approach tried | Why it failed |
+|---|---|---|
+| 1 | Filter `onnxruntime-gpu` out of CosyVoice's `requirements.txt` and install a newer `>=1.20.0,<1.26.0` separately | Resolved the ORT pin, but `torch==2.3.1` (which has no wheel AND no sdist — PyTorch doesn't ship sdists) remained an unresolvable hard blocker. |
+| 2 | Filter `openai-whisper` out too and install a newer release | `cosyvoice/cli/frontend.py:11` does `import whisper` and `frontend.py:98` calls `whisper.log_mel_spectrogram(speech, n_mels=128)` in the cross-lingual inference path. Not a "demo script" dep — actively used at inference time. The sanity check would fail immediately with `ModuleNotFoundError` if we filtered it. |
+| 3 | Relax `torch==2.3.1` to a range with cp313 wheels (>=2.9.1) | CosyVoice3 is built against torch 2.3.1's specific Qwen2 LLM, SDPA, and tensor APIs. Bumping to 2.9.1+ risks silent model-quality regression (different numerics in attention, layernorm fp32 promotion, etc.). Untested territory. |
+| 4 | Pin Colab to Python 3.12 via the runtime UI | Not viable. Colab removed the per-runtime Python version selector. Community kernel-swap hacks (e.g., manually downloading python.org tarballs) break Colab's own kernel bridge. |
+| **5** | **Isolate CosyVoice in its own Python 3.11 venv on Drive** | **Chosen. The main Colab kernel (3.13) runs the pipeline orchestration; a long-running subprocess in the venv handles TTS over a JSON-over-stdio protocol. CosyVoice's `requirements.txt` is installed unmodified in the venv, where Py3.11 has full wheel support for all the pins. The 30-40 s model load is paid once and amortized across all segments.** |
+
+### Architecture details
+
+- **Main kernel (Py3.13)**: `pipeline.py` orchestration, faster-whisper
+  (transcription), Ollama (translation), ffmpeg/yt-dlp (video IO), the
+  `synthesize_dubbed_audio` function in pipeline.py spawns and manages
+  the subprocess.
+- **CosyVoice venv (Py3.11)**: lives at `$DRIVE_ROOT/cosyv_venv311` so
+  it persists across Colab session reconnects. Created by
+  `scripts/colab_setup.py` Stage 2 (apt-install python3.11 via main
+  repos or deadsnakes PPA fallback, then `python3.11 -m venv`).
+  CosyVoice's pinned `requirements.txt` is installed unmodified in
+  Stage 7 via the venv's `pip`.
+- **IPC protocol**: newline-delimited JSON over stdin/stdout. Main
+  writes `{"text": "...", "ref_audio": "...", "out_path": "..."}\n`;
+  venv writes `{"ok": true, "out_path": "...", "duration": 1.23}\n` (or
+  `{"ok": false, "error": "..."}`). The venv-side driver is
+  `scripts/cosyv_infer.py`; it loads `AutoModel` on the first job and
+  holds it in memory for subsequent jobs.
+- **Discovery**: `scripts/colab_setup.py` Stage 8 writes
+  `$DRIVE_ROOT/cosyv_venv311/venv_python_path.json` containing
+  `{"venv_dir", "venv_python", "model_dir", "cosyvoice_repo"}`.
+  `pipeline.py._find_cosy_venv()` reads this file (searching
+  `COSYV_VENV_DIR` env var first, then the default Drive location).
+- **Crash recovery**: on subprocess death mid-run, `pipeline.py`
+  respawns the subprocess once and retries the failed segment. If the
+  respawn also fails, the segment raises `RuntimeError` with the
+  drained stderr included in the message.
+
+### Why this is better than the previous approaches
+
+- **No filter/relax logic to maintain.** CosyVoice's `requirements.txt`
+  is installed verbatim.
+- **No risk of inference-path regression from a newer torch.** The
+  venv runs the original torch 2.3.1.
+- **Re-running the setup script is fast on warm sessions.** A marker
+  file at `$DRIVE_ROOT/cosyv_venv311/.youdub_venv_ready` short-circuits
+  Stages 2-7 in seconds; only the sanity check (Stage 8) re-runs the
+  import test.
+- **One model load per `run_pipeline` call, not per segment.** The
+  long-running subprocess caches `AutoModel` across all segments.
+
+### Tradeoffs accepted
+
+- **~3 GB extra on Drive for the venv** (torch + onnxruntime-gpu + the
+  full CosyVoice dep tree). The venv co-exists with the existing
+  ~10 GB of CosyVoice weights on Drive; total Drive usage is ~15 GB.
+- **No in-process AutoModel access.** Anything that previously called
+  `pipeline._get_cosyvoice()` directly (only tests, in our case) now
+  has to go through the subprocess protocol. This is a clean boundary
+  but a real change for any future code that wants the model in-process.
+- **Subprocess IPC has slightly higher per-job overhead than in-process
+  calls** (~1-2 ms per JSON line vs. ~0 ms in-process). For 20-50
+  segments this is invisible compared to the per-segment TTS latency
+  (~1-3 s).
+
+---
+
 ## Phase 1 — Core Pipeline
 
 ### What was built
@@ -180,8 +254,9 @@ YouDub/
 ├── requirements.txt        # light deps (install first)
 ├── cosyv_requirements.txt  # reference copy of CosyVoice's pinned deps
 ├── scripts/
-│   └── colab_setup.py      # single source of truth for Colab setup
-├── setup_colab.md          # 6-cell thin runner notebook guide
+│   ├── colab_setup.py      # single source of truth for Colab setup
+│   └── cosyv_infer.py      # long-running CosyVoice subprocess driver (runs in venv)
+├── setup_colab.md          # 5-cell thin runner notebook guide
 ├── test_url.txt            # placeholder for the test Shorts URL
 └── progress.md             # this file
 ```
@@ -355,4 +430,102 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     file, installs from that, then runs the separate onnxruntime
     install pass as before. Added a comment in the script warning
     future maintainers not to re-introduce `--exclude`.
+
+- **post-Phase-1 — `_run()` swallowed subprocess failure output (recurring pain)**
+  - What happened: Every time a subprocess (pip install, apt-get, git,
+    etc.) failed inside `scripts/colab_setup.py`, the script printed
+    `subprocess.CalledProcessError: Command '...' returned non-zero exit
+    status N` and nothing else. To see the actual error, we had to
+    manually re-run the failing command outside the script. This
+    happened at least three times during the hackathon — once for the
+    onnxruntime pin, once for a transient HF download error, and once
+    for a stale git lockfile.
+  - What I tried: Reading `CalledProcessError.__str__` to see if there
+    was a hidden kwarg. There isn't — Python's stdlib deliberately
+    doesn't include captured output in the exception's string form, so
+    `raise` from inside `subprocess.run` leaves us no chance to print
+    anything.
+  - What worked: Wrapped the `subprocess.run` call inside `_run()` in
+    a `try/except CalledProcessError`. On failure, print a small header
+    plus the last 3000 characters of the captured output (which already
+    includes stderr because `_run` uses `stderr=subprocess.STDOUT`),
+    then re-raise. The header includes a "skipped N" line if the output
+    was truncated. A `UnicodeEncodeError` guard around the print means
+    a single weird byte in pip's output can't crash the script just to
+    report on a different error. Refactored `stage_sanity_check` to
+    also go through `_run(check=False)` so the AutoModel import sanity
+    check gets the same treatment.
+  - Root cause: `subprocess.run(check=True)` raises inside the call
+    before we get a chance to inspect the `CompletedProcess`, and
+    `CalledProcessError` doesn't carry output in its `__str__`. We
+    needed to either: (a) set `check=False` everywhere and handle
+    return codes ourselves, or (b) wrap each call in a try/except.
+    Option (b) keeps the API the same for the 9 existing call sites
+    (they still get free `check=True` semantics) and is a smaller
+    diff.
+    - Fix applied: New `_print_failure_output(pretty_cmd, output)` helper
+      in `scripts/colab_setup.py` that handles the truncation, header,
+      and UnicodeEncodeError guard. `_run()` now wraps the
+      `subprocess.run` call in a try/except that calls the helper and
+      re-raises. New `_FAILURE_OUTPUT_TAIL_CHARS = 3000` constant
+      controls the truncation. `check=False` call sites (currently just
+      the `git pull` non-fatal-failure path) are unaffected — they
+      don't raise, so the helper isn't called. Success-path output is
+      still silent. From now on, a failing pip install inside the script
+      will print the real error message directly in the script's output,
+      no manual re-run required.
+
+- **post-Phase-1 — Architecture: isolate CosyVoice in a Python 3.11 venv**
+  - What happened: After filtering out `onnxruntime-gpu` and
+    `openai-whisper` from CosyVoice's `requirements.txt` and installing
+    newer compatible versions, the next blocker was `torch==2.3.1` —
+    CosyVoice's exact pin has no cp313 wheel AND no sdist (PyTorch
+    doesn't ship sdists). Considered relaxing the pin to a cp313 range
+    (>=2.9.1), but that risks Qwen2 LLM numerics drift in CosyVoice3's
+    inference path. Considered pinning Colab to Python 3.12 via the
+    runtime UI, but that option was removed by Google. Considered
+    community kernel-swap hacks, but they break Colab's own kernel
+    bridge. The clean answer: don't try to make CosyVoice run in the
+    Colab kernel at all. Isolate it.
+  - What I tried: All four of the above, in sequence. The first two
+    taught us the boundary of what we could fix in-process. The third
+    was a real risk we weren't willing to take. The fourth wasn't
+    available. See the "## Python 3.13 compatibility" section above
+    for the full table.
+  - What worked: `scripts/colab_setup.py` gets a new Stage 2 that
+    apt-installs Python 3.11 (trying main repos first, falling back to
+    the deadsnakes PPA, with a clear failure message if both fail) and
+    creates `$DRIVE_ROOT/cosyv_venv311`. Stage 7 installs CosyVoice's
+    ORIGINAL, UNMODIFIED `requirements.txt` into the venv — no
+    filtering, no pin-relaxing. Stage 8 runs the AutoModel sanity
+    check via the venv's python and writes
+    `venv_python_path.json` so the main process can discover the
+    interpreter. `pipeline.py`'s `synthesize_dubbed_audio` is refactored
+    to spawn `scripts/cosyv_infer.py` as a long-running subprocess and
+    talk to it over a newline-delimited JSON protocol on stdin/stdout.
+    The subprocess loads `AutoModel` once and holds it across all
+    segments, so the 30-40 s model load is paid once per
+    `run_pipeline` call, not per segment.
+  - Root cause: Colab's default kernel is Python 3.13, and CosyVoice3
+    is built against a specific Py3.11 ecosystem. The two are
+    fundamentally incompatible for in-process CosyVoice execution. The
+    venv is the cleanest available boundary.
+  - Fix applied: New `scripts/cosyv_infer.py` (long-running CosyVoice
+    driver, ~150 lines). Major refactor of
+    `scripts/colab_setup.py` (added Stage 2 venv creation, reverted the
+    filter helpers from the previous two turns, added a new env var
+    `COSYV_VENV_PYTHON` to `colab_env.sh`, added `--skip-venv` flag).
+    Major refactor of `pipeline.py` (replaced in-process
+    `_get_cosyvoice` with subprocess-based `_find_cosy_venv` +
+    `_start_cosyv_subprocess` + `_send_cosyv_job` +
+    `_stop_cosyv_subprocess` helpers; deleted `_get_cosyvoice`,
+    `_cosyvoice_synth_one`, `_add_cosyvoice_to_path`, the in-process
+    `import torchaudio` in `synthesize_dubbed_audio`, and the
+    `_COSYVOICE_MODEL` / `_COSYVOICE_MODEL_DIR` module-level cache).
+    `setup_colab.md` rewritten with a prominent
+    "Two-environment architecture" section. `progress.md` gets a new
+    "## Python 3.13 compatibility" section that documents the four
+    failed approaches and the one that worked. The previous
+    onnxruntime-filter and openai-whisper-filter entries stay as
+    historical record of the path we took.
 
