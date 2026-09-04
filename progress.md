@@ -283,3 +283,39 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     deprecated — any future setup changes go into the script, not
     the notebook.
 
+- **post-Phase-1 — `onnxruntime-gpu==1.18.0` not installable on Colab (no matching distribution)**
+  - What happened: `pip install -r CosyVoice/requirements.txt` failed with
+    `Could not find a version that satisfies the requirement
+    onnxruntime-gpu==1.18.0`. CosyVoice's pinned version is from May 2024
+    and has no cp313 wheel; Colab now defaults to Python 3.13.
+  - What I tried: First instinct was to edit `CosyVoice/requirements.txt`
+    in the cloned repo. Realised that would (a) be wiped on the next
+    `git pull` and (b) leave no record of the override in our own code.
+  - What worked: Two-step install in `scripts/colab_setup.py`:
+    1. `pip install -r requirements.txt --exclude onnxruntime
+       --exclude onnxruntime-gpu` (gets everything else from the pin
+       list normally, just skips the two offending packages).
+    2. `pip install "onnxruntime-gpu>=1.20.0,<1.26.0"` (Linux) or
+       `"onnxruntime>=1.20.0,<1.26.0"` (Win/mac — auto-selected by
+       `sys.platform`).
+  - Root cause: Microsoft ships `onnxruntime-gpu` cp313 wheels starting at
+    1.20.0 (Nov 2024). CosyVoice's 1.18.0 pin predates Python 3.13 and
+    was never updated. CosyVoice's own onnxruntime API surface is
+    vanilla (only `SessionOptions`, `GraphOptimizationLevel.ORT_ENABLE_ALL`,
+    `InferenceSession`, and `session.run`), so 1.20+ is API-compatible
+    with no functional difference.
+  - Fix applied: New `ONNXRUNTIME_VERSION = ">=1.20.0,<1.26.0"`
+    constant at the top of `scripts/colab_setup.py`. New
+    `_onnxruntime_pkg_name()` helper picks `onnxruntime-gpu` (Linux)
+    or `onnxruntime` (Win/mac) to mirror CosyVoice's own
+    `sys_platform` markers. `stage_install_cosyv_deps` now does the
+    two-step install and reports the actual installed version via
+    `pip show` so the log shows what landed. Existing marker-file
+    idempotency (`.youdub_cosyv_deps_installed`) covers both passes.
+    No edit to upstream `CosyVoice/requirements.txt` (would be wiped
+    on re-clone) and no edit to our reference `cosyv_requirements.txt`
+    (it's a faithful copy of upstream; the docstring in the script
+    explains where the override happens). Bump `ONNXRUNTIME_VERSION`
+    in the script if a future CosyVoice release changes its onnx
+    requirements.
+

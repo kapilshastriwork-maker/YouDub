@@ -70,6 +70,20 @@ LIGHT_PIP_DEPS = [
 
 APT_PACKAGES = ["ffmpeg", "sox", "libsox-dev", "git-lfs"]
 
+# CosyVoice's upstream requirements.txt pins onnxruntime-gpu==1.18.0 (Linux)
+# and onnxruntime==1.18.0 (Win/mac). That exact version has no cp313 wheel
+# (it shipped May 2024, before Python 3.13 existed), and current Colab now
+# defaults to Python 3.13 — so the pin fails to resolve. We install
+# requirements.txt with onnxruntime* excluded, then separately install this
+# compatible range. Bump the upper bound here if a future CosyVoice release
+# requires it.
+#
+# CosyVoice only uses vanilla onnxruntime APIs (SessionOptions,
+# GraphOptimizationLevel.ORT_ENABLE_ALL, InferenceSession, session.run), so
+# 1.20+ is API-compatible. Confirmed against cosyvoice/utils/onnx.py and
+# cosyvoice/cli/frontend.py.
+ONNXRUNTIME_VERSION = ">=1.20.0,<1.26.0"
+
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -315,6 +329,14 @@ def stage_download_weights(args: argparse.Namespace) -> str:
 COSYV_DEPS_MARKER = ".youdub_cosyv_deps_installed"
 
 
+def _onnxruntime_pkg_name() -> str:
+    """Return `onnxruntime-gpu` on Linux, `onnxruntime` (CPU) elsewhere.
+
+    Mirrors the sys_platform markers in CosyVoice's requirements.txt.
+    """
+    return "onnxruntime-gpu" if sys.platform.startswith("linux") else "onnxruntime"
+
+
 def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
     if args.skip_cosyv_deps:
         _log("6/7 cosyv-deps", "skipped (--skip-cosyv-deps)")
@@ -326,13 +348,57 @@ def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
     req = os.path.join(repo, "requirements.txt")
     if not os.path.isfile(req):
         raise RuntimeError(f"CosyVoice requirements.txt missing at {req}")
-    _log("6/7 cosyv-deps", "pip install -r requirements.txt (2-3 min)")
+
+    ort_pkg = _onnxruntime_pkg_name()
+
+    # Pass 1: install requirements.txt with onnxruntime* excluded.
+    # CosyVoice's pinned ort==1.18.0 has no cp313 wheel, so resolving
+    # requirements.txt as-written fails on Colab's Python 3.13 default.
+    # We don't edit the upstream requirements.txt (it lives in a cloned
+    # repo and would be wiped on re-clone) — we exclude the offending
+    # package and pin a compatible range separately below.
+    _log(
+        "6/7 cosyv-deps",
+        f"pip install -r requirements.txt --exclude onnxruntime --exclude onnxruntime-gpu (2-3 min)",
+    )
     _run(
-        [sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "-r",
+            "requirements.txt",
+            "--exclude",
+            "onnxruntime",
+            "--exclude",
+            "onnxruntime-gpu",
+        ],
         cwd=repo,
     )
+
+    # Pass 2: install the compatible onnxruntime range.
+    ort_spec = f"{ort_pkg}{ONNXRUNTIME_VERSION}"
+    _log("6/7 cosyv-deps", f"pip install {ort_spec} (1 min)")
+    _run([sys.executable, "-m", "pip", "install", "-q", ort_spec], cwd=repo)
+
+    # Report the actual version installed, so the log shows what we got.
+    show = _run(
+        [sys.executable, "-m", "pip", "show", ort_pkg],
+        check=False,
+        cwd=repo,
+    )
+    installed_version = "(unknown)"
+    for line in show.stdout.splitlines():
+        if line.startswith("Version:"):
+            installed_version = line.split(":", 1)[1].strip()
+            break
+    _log("6/7 cosyv-deps", f"installed {ort_pkg}=={installed_version}")
+
     Path(marker).write_text(
-        f"Installed by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n",
+        f"Installed by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n"
+        f"{ort_pkg}=={installed_version}\n",
         encoding="utf-8",
     )
     _log("6/7 cosyv-deps", f"wrote marker {marker}")
