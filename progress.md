@@ -529,3 +529,31 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     onnxruntime-filter and openai-whisper-filter entries stay as
     historical record of the path we took.
 
+- **post-Phase-1 — `openai-whisper==20231117` build failed: `ModuleNotFoundError: No module named 'pkg_resources'`**
+  - What happened: Stage 7's `pip install -r requirements.txt` inside the
+    Py3.11 venv failed while building openai-whisper. Verbose pip log
+    showed the import error from openai-whisper's old setup.py.
+  - What I tried: Confirmed it's NOT a Python 3.13 issue (we're in the
+    Py3.11 venv now). Confirmed openai-whisper==20231117 has no upper
+    pin conflict. The earlier `## Python 3.13 compatibility` investigation
+    had filtered openai-whisper out and installed a newer release, but
+    that was solving the wrong problem — this is a setuptools regression.
+  - What worked: Pinning `setuptools<80` into the venv *before*
+    installing CosyVoice's requirements.txt. setuptools 80 split
+    pkg_resources out of the default install into a separate
+    `setuptools-pkg-resources` package, so venvs created with newer
+    setuptools no longer have `pkg_resources` importable. openai-whisper
+    20231117 imports it directly at build time. Also dropped the `-U`
+    flag from the requirements.txt install — CosyVoice's pins are
+    intentional and we don't want pip to silently upgrade past a
+    version the Qwen2 LLM path was built against.
+  - Root cause: setuptools 80 split pkg_resources out of the default
+    install; openai-whisper 20231117's setup.py imports it directly.
+    Unrelated to the Python 3.13 / CosyVoice-pin story.
+  - Fix applied: `stage_install_cosyv_deps` now bootstraps
+    `setuptools<80` into the venv first, then installs
+    `requirements.txt` without `-U`. Marker file semantics unchanged
+    (still guards the whole stage). The setuptools install runs on
+    every invocation — no separate marker, since it's cheap (~2s) and
+    the version pin is idempotent.
+

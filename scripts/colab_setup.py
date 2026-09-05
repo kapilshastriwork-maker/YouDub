@@ -560,8 +560,20 @@ def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
     if not os.path.isfile(req):
         raise RuntimeError(f"CosyVoice requirements.txt missing at {req}")
 
+    # openai-whisper==20231117's old setup.py imports `pkg_resources` at
+    # build time. setuptools 80 split pkg_resources into a separate
+    # `setuptools-pkg-resources` package, so venvs created with newer
+    # setuptools don't have it and the build fails. Pin setuptools<80
+    # into the venv first so pkg_resources is bundled. Cheap on warm
+    # re-runs (~2s).
+    _log("7/8 cosyv-deps", "bootstrapping setuptools<80 (pkg_resources dependency)")
+    _run([py, "-m", "pip", "install", "-q", "setuptools<80"])
+
     _log("7/8 cosyv-deps", f"pip install -r {req} (via venv python, 5-10 min)")
-    _run([py, "-m", "pip", "install", "-q", "-U", "-r", req], cwd=repo)
+    # No -U: CosyVoice's pins are intentional; we want exact versions,
+    # not "newest compatible". An upgrade could silently bump past a
+    # version that the Qwen2 LLM path was built against.
+    _run([py, "-m", "pip", "install", "-q", "-r", req], cwd=repo)
 
     Path(marker).write_text(
         f"Installed by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n"
