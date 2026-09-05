@@ -699,3 +699,46 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     new defaults are picked up automatically by the existing
     `run_pipeline` call).
 
+- **post-Phase-1 — DeepSpeed's accelerator-detection log pollutes CosyVoice subprocess JSON protocol**
+  - What happened: CosyVoice's `AutoModel` import triggers DeepSpeed's
+    `real_accelerator.py`, which prints `[WARNING] ... Setting
+    accelerator to CPU ...` to **stdout** (not stderr) on import. Our
+    subprocess protocol treats stdout as a strict newline-delimited
+    JSON channel, so this one line caused `json.loads()` to fail with
+    `Expecting ',' delimiter` on the pipeline.py side. The same
+    message was visible during the Stage 8 sanity check, which is how
+    we traced the source.
+  - What I tried: Setting `PYTHONWARNINGS=ignore` and `DS_VERBOSE=0` —
+    DeepSpeed's accelerator selection still prints on import. Tried a
+    `logging.getLogger("deepspeed").setLevel(logging.ERROR)` patch in
+    the parent before spawn — does not catch DeepSpeed's `print()`
+    (logging and `print` are different code paths).
+  - What worked: Two-layer fix. (1) At the very top of
+    `scripts/cosyv_infer.py`, save the real stdout file descriptor via
+    `os.dup(1)` and point `sys.stdout` at `sys.stderr` for the duration
+    of imports and model load. This catches Python-level `print()`
+    calls from any library (the common case). All JSON protocol
+    responses are written via `_real_stdout` (the saved FD), not via
+    `print()`. (2) Defensively filter non-JSON lines on the consumer
+    side in `pipeline.py:_send_cosyv_job`: read lines in a loop, skip
+    non-JSON lines with a warning log, return the first valid JSON
+    object. Cap at 50 skips per job to bound the cost of a truly
+    broken protocol.
+  - Root cause: DeepSpeed's `real_accelerator.py` writes its accelerator-
+    selection banner directly to FD 1 (stdout) on import, bypassing
+    any Python-level `sys.stdout` reassignment. A pure Python-level
+    redirect alone is not enough; we need to (a) preserve a real-FD
+    handle for protocol writes and (b) defensively skip any pollution
+    that sneaks through anyway.
+  - Fix applied: `scripts/cosyv_infer.py` now saves the real stdout FD
+    at module top (`_real_stdout_fd = os.dup(1); _real_stdout =
+    os.fdopen(...)`) and uses `_real_stdout.write(...)` for all
+    protocol responses (centralised in `_send()`). `sys.stdout` is
+    redirected to `sys.stderr` for the duration of imports/model load
+    so any Python-level `print()` from library code lands on stderr
+    instead. `pipeline.py:_send_cosyv_job` now loops on
+    `proc.stdout.readline()` and skips non-JSON lines (up to a cap of
+    50 per job), with a warning log on each skip. This means future
+    print leaks degrade gracefully (one log line per skip, then
+    continue) instead of killing the segment.
+

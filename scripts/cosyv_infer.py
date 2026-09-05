@@ -40,6 +40,26 @@ import sys
 import traceback
 from typing import Any, Optional
 
+# Save the real stdout file descriptor before any library imports can
+# pollute it. DeepSpeed's real_accelerator.py prints its accelerator-
+# selection banner ("[WARNING] ... Setting accelerator to CPU ...")
+# directly to FD 1 (stdout) on import, bypassing Python-level
+# sys.stdout reassignment. If we let it land on the JSON protocol
+# channel, json.loads() on the parent side fails with
+# "Expecting ',' delimiter".
+#
+# We do TWO things:
+#   1. Save the real stdout FD as a separately-wrritable handle so
+#      protocol responses are guaranteed clean.
+#   2. Point sys.stdout at sys.stderr for the duration of imports and
+#      model load. This catches Python-level print() calls from any
+#      library (the common case). Things that write DIRECTLY to FD 1
+#      (some C extensions) still leak; the consumer-side filter in
+#      pipeline.py:_send_cosyv_job handles those.
+_real_stdout_fd = os.dup(1)
+_real_stdout = os.fdopen(_real_stdout_fd, "w", buffering=1, encoding="utf-8")
+sys.stdout = sys.stderr
+
 
 def _log(msg: str) -> None:
     """Log to stderr. stdout is the protocol channel — keep it clean."""
@@ -155,11 +175,15 @@ def _main_loop(model: Any) -> int:
 
 
 def _send(obj: dict) -> None:
-    """Write one JSON response line to stdout and flush immediately so
-    the main process can read it without buffering delays.
+    """Write one JSON response line to the real stdout file descriptor and
+    flush immediately so the main process can read it without buffering
+    delays. We use `_real_stdout` (the FD saved at module top) rather
+    than `sys.stdout` so that any future reassignment of `sys.stdout`
+    (or any library that writes through it) cannot corrupt the protocol
+    channel.
     """
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    _real_stdout.write(json.dumps(obj) + "\n")
+    _real_stdout.flush()
 
 
 def main(argv: Optional[list[str]] = None) -> int:

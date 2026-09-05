@@ -242,8 +242,13 @@ def _send_cosyv_job(
 ) -> dict:
     """Send one TTS job to the CosyVoice subprocess and read the response.
 
-    Raises RuntimeError on subprocess death or protocol error. The caller
-    decides whether to abort the run or respawn and retry.
+    Defensively skips non-JSON lines on stdout (e.g., a future library
+    print leak) and only raises if the subprocess dies or we exceed a
+    sanity cap on the number of non-JSON lines we'll tolerate. The
+    cosyv_infer.py side does its own redirect of sys.stdout, but C
+    extensions that write directly to FD 1 (like DeepSpeed's
+    real_accelerator.py banner) still leak through; this filter
+    catches those gracefully.
     """
     job = json.dumps({"text": text, "ref_audio": ref_audio, "out_path": out_path})
     assert proc.stdin is not None and proc.stdout is not None
@@ -255,25 +260,42 @@ def _send_cosyv_job(
             f"CosyVoice subprocess stdin closed while sending job: {e}"
         ) from e
 
-    line = proc.stdout.readline()
-    if not line:
-        # Subprocess died (or closed stdout). Drain stderr for the cause.
-        stderr = ""
+    # Read until we get a valid JSON object, skipping stray non-JSON
+    # lines (e.g., DeepSpeed / other C-extension prints that bypass
+    # Python's sys.stdout). Cap to avoid infinite loops on a broken
+    # protocol. 50 is generous enough for transient pollution but tight
+    # enough to bound the cost of a truly broken protocol.
+    max_skips = 50
+    for _ in range(max_skips + 1):
+        line = proc.stdout.readline()
+        if not line:
+            # Subprocess died (or closed stdout). Drain stderr for the cause.
+            stderr = ""
+            try:
+                if proc.stderr is not None:
+                    stderr = proc.stderr.read() or ""
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"CosyVoice subprocess closed stdout unexpectedly. "
+                f"stderr (if any): {stderr[-1000:].strip()}"
+            )
+        line = line.strip()
+        if not line:
+            continue  # blank line
         try:
-            if proc.stderr is not None:
-                stderr = proc.stderr.read() or ""
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"CosyVoice subprocess closed stdout unexpectedly. "
-            f"stderr (if any): {stderr[-1000:].strip()}"
-        )
-    try:
-        return json.loads(line)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(
-            f"CosyVoice subprocess sent malformed response: {line!r}"
-        ) from e
+            return json.loads(line)
+        except json.JSONDecodeError:
+            log.warning(
+                "CosyVoice subprocess sent non-JSON line on stdout, skipping: %r",
+                line[:200],
+            )
+            continue
+    # If we got here, we hit the skip cap without a valid JSON.
+    raise RuntimeError(
+        f"CosyVoice subprocess sent {max_skips}+ non-JSON lines in a row; "
+        f"protocol is likely broken."
+    )
 
 
 def _stop_cosyv_subprocess(proc: Optional[subprocess.Popen]) -> None:
