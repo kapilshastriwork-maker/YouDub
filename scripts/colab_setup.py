@@ -220,6 +220,37 @@ def _pip_installed(pkg: str) -> bool:
         return False
 
 
+def _filter_requirements_txt(path: str, drop_pkgs: set[str]) -> str:
+    """Return the path to a temp file containing `path` with lines whose
+    first non-whitespace token's package name matches one of `drop_pkgs`
+    removed. Preserves comments, blank lines, --extra-index-url, and
+    unrelated packages. Caller is responsible for cleaning up the file.
+
+    Used to skip packages that need special install handling (e.g.,
+    `--no-build-isolation`) from a bulk `pip install -r` call. The
+    package-name match is case-insensitive and stops at the first
+    version/specifier character (==, >=, ~=, ;, ,).
+    """
+    import re
+    import tempfile
+
+    drop = {p.lower() for p in drop_pkgs}
+    pattern = re.compile(r"^\s*([A-Za-z0-9_.+-]+)")
+    keep: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            m = pattern.match(line)
+            if m and m.group(1).lower() in drop:
+                continue
+            keep.append(line)
+    fd, out = tempfile.mkstemp(
+        prefix="youdub_cosyv_filtered_", suffix=".txt", text=True
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.writelines(keep)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: paths & env vars
 # ---------------------------------------------------------------------------
@@ -561,19 +592,63 @@ def stage_install_cosyv_deps(args: argparse.Namespace, repo: str) -> None:
         raise RuntimeError(f"CosyVoice requirements.txt missing at {req}")
 
     # openai-whisper==20231117's old setup.py imports `pkg_resources` at
-    # build time. setuptools 80 split pkg_resources into a separate
-    # `setuptools-pkg-resources` package, so venvs created with newer
-    # setuptools don't have it and the build fails. Pin setuptools<80
-    # into the venv first so pkg_resources is bundled. Cheap on warm
-    # re-runs (~2s).
-    _log("7/8 cosyv-deps", "bootstrapping setuptools<80 (pkg_resources dependency)")
-    _run([py, "-m", "pip", "install", "-q", "setuptools<80"])
+    # build time. Two preconditions must be in place in the venv before
+    # we install it:
+    #   1. setuptools<80 — setuptools 80 split pkg_resources into a
+    #      separate `setuptools-pkg-resources` package, so venvs created
+    #      with newer setuptools don't have it and the build fails.
+    #   2. wheel — required by --no-build-isolation (see below).
+    # Pin both into the venv first. Cheap on warm re-runs (~2s).
+    _log(
+        "7/8 cosyv-deps",
+        "bootstrapping setuptools<80 + wheel (build deps for --no-build-isolation)",
+    )
+    _run([py, "-m", "pip", "install", "-q", "setuptools<80", "wheel"])
 
-    _log("7/8 cosyv-deps", f"pip install -r {req} (via venv python, 5-10 min)")
-    # No -U: CosyVoice's pins are intentional; we want exact versions,
-    # not "newest compatible". An upgrade could silently bump past a
-    # version that the Qwen2 LLM path was built against.
-    _run([py, "-m", "pip", "install", "-q", "-r", req], cwd=repo)
+    # Main requirements.txt install, but with openai-whisper filtered
+    # out. openai-whisper is installed separately below with
+    # --no-build-isolation so it builds against the venv's setuptools<80
+    # rather than a fresh isolated build env (pip's default build
+    # isolation would fetch the latest setuptools into a throwaway
+    # env, making our setuptools<80 pin invisible to the build step).
+    filtered_req = _filter_requirements_txt(req, drop_pkgs={"openai-whisper"})
+    try:
+        _log(
+            "7/8 cosyv-deps",
+            f"pip install -r {req} (openai-whisper filtered out) via venv python, 5-10 min",
+        )
+        # No -U: CosyVoice's pins are intentional; we want exact versions,
+        # not "newest compatible". An upgrade could silently bump past a
+        # version that the Qwen2 LLM path was built against.
+        _run([py, "-m", "pip", "install", "-q", "-r", filtered_req], cwd=repo)
+    finally:
+        # Leave the temp file in place for post-mortem on failure; clean
+        # up on success.
+        try:
+            os.unlink(filtered_req)
+        except OSError:
+            pass
+
+    # openai-whisper: install separately with --no-build-isolation so
+    # the build uses the venv's setuptools<80 (which has pkg_resources
+    # bundled) rather than a fresh isolated env with the latest
+    # setuptools (which doesn't). wheel is already in the venv from
+    # the bootstrap step above.
+    _log(
+        "7/8 cosyv-deps",
+        "pip install openai-whisper==20231117 (--no-build-isolation, uses venv setuptools<80)",
+    )
+    _run(
+        [
+            py,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--no-build-isolation",
+            "openai-whisper==20231117",
+        ]
+    )
 
     Path(marker).write_text(
         f"Installed by colab_setup.py on {os.environ.get('HOSTNAME', 'unknown')}\n"

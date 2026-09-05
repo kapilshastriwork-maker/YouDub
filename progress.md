@@ -538,7 +538,7 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     pin conflict. The earlier `## Python 3.13 compatibility` investigation
     had filtered openai-whisper out and installed a newer release, but
     that was solving the wrong problem — this is a setuptools regression.
-  - What worked: Pinning `setuptools<80` into the venv *before*
+  - What worked (part 1): Pinning `setuptools<80` into the venv *before*
     installing CosyVoice's requirements.txt. setuptools 80 split
     pkg_resources out of the default install into a separate
     `setuptools-pkg-resources` package, so venvs created with newer
@@ -547,13 +547,55 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     flag from the requirements.txt install — CosyVoice's pins are
     intentional and we don't want pip to silently upgrade past a
     version the Qwen2 LLM path was built against.
-  - Root cause: setuptools 80 split pkg_resources out of the default
-    install; openai-whisper 20231117's setup.py imports it directly.
-    Unrelated to the Python 3.13 / CosyVoice-pin story.
-  - Fix applied: `stage_install_cosyv_deps` now bootstraps
+  - **Part 1 was insufficient on its own** — see the next entry for
+    the build-isolation follow-up.
+  - Root cause (part 1): setuptools 80 split pkg_resources out of the
+    default install; openai-whisper 20231117's setup.py imports it
+    directly. Unrelated to the Python 3.13 / CosyVoice-pin story.
+  - Fix applied (part 1): `stage_install_cosyv_deps` now bootstraps
     `setuptools<80` into the venv first, then installs
     `requirements.txt` without `-U`. Marker file semantics unchanged
     (still guards the whole stage). The setuptools install runs on
     every invocation — no separate marker, since it's cheap (~2s) and
-    the version pin is idempotent.
+    the version pin is idempotent. **This entry is kept as historical
+    record; the actually-correct fix is the build-isolation entry
+    below.**
+
+- **post-Phase-1 — `setuptools<80` alone didn't fix openai-whisper's build (pip build isolation)**
+  - What happened: After installing `setuptools<80` into the venv,
+    openai-whisper's build still failed with the same
+    `ModuleNotFoundError: No module named 'pkg_resources'`. Direct
+    check inside the venv confirmed `setuptools` 79.x and
+    `pkg_resources` were both importable.
+  - What I tried: Re-running Stage 7, re-checking the venv's
+    `setuptools` version (correct, 79.x). Suspected a different cause
+    when the same error recurred.
+  - What worked: pip's default build isolation creates a fresh,
+    throwaway environment for each package's build step, seeded with
+    the latest setuptools from PyPI — completely ignoring the venv's
+    installed packages. So `setuptools<80` in the venv is invisible
+    to the build subprocess. Fix: install openai-whisper separately
+    with `--no-build-isolation`, which tells pip to use the venv's
+    own environment for build deps. Two preconditions must be in
+    place in the venv first: (1) `setuptools<80` (so pkg_resources
+    is bundled), (2) `wheel` (so bdist_wheel works without an
+    isolated env). openai-whisper is also filtered out of the main
+    `requirements.txt` install (via a temp-file filter, same pattern
+    as the historical onnx filter) so the main batch doesn't fail
+    trying to build it with the default isolated env.
+  - Root cause: pip's build-isolation feature fetches its own
+    setuptools into a throwaway build env per package, so venv-level
+    setuptools pins are not visible to the build step.
+    `--no-build-isolation` opts out of this for the specific package.
+  - Fix applied: `stage_install_cosyv_deps` now (1) installs
+    `setuptools<80 wheel` into the venv (combined call), (2) runs a
+    filtered `requirements.txt` install with `openai-whisper` removed
+    (via the new `_filter_requirements_txt(path, drop_pkgs)` helper,
+    which writes the filtered copy to a temp file — deleted on
+    success, left in place for post-mortem on failure), (3) runs a
+    separate `pip install --no-build-isolation openai-whisper==20231117`
+    so it builds against the venv's setuptools<80. Marker file
+    semantics unchanged. The setuptools+wheel install runs on every
+    invocation (no separate marker) — cheap (~2-3s) and the version
+    pin is idempotent.
 
