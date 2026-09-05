@@ -223,10 +223,10 @@ Supporting infrastructure:
 3. **No segment overlap handling.** `mux_final_video` assumes the input
    segments' `start` values are non-decreasing and non-overlapping. Faster-
    whisper + VAD should produce this, but it isn't enforced.
-4. **yt-dlp may fail on Instagram without cookies.** YouTube may need
-   PO tokens on `n`/`tv` clients. The setup cell does not export
-   cookies; users hitting 401/403 will need to add `cookiefile` to the
-   `dl_opts` dict in `download_video`.
+4. **yt-dlp auth requires a cookies.txt file in Colab.** Set
+   `COOKIEFILE_PATH` (or pass `cookiefile=` to `download_video` /
+   `run_pipeline`) — see the "yt-dlp blocked by YouTube bot detection"
+   entry in Errors & Fixes for setup details.
 5. **Ollama on the same Colab T4 will OOM once CosyVoice3 is loaded.**
    Combined VRAM ~3.5 GB; T4 has 16 GB so it should actually fit, but
    the first model load is slow and contention with the CUDA context is
@@ -598,4 +598,34 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     semantics unchanged. The setuptools+wheel install runs on every
     invocation (no separate marker) — cheap (~2-3s) and the version
     pin is idempotent.
+
+- **post-Phase-1 — yt-dlp blocked by YouTube bot detection on Colab ("Sign in to confirm you're not a bot")**
+  - What happened: `download_video` failed on Colab with YouTube's
+    bot-detection interstitial. Google Cloud IPs are flagged more
+    aggressively than residential IPs, and yt-dlp without
+    authentication can't bypass the check.
+  - What I tried: Re-running, retry-with-backoff — same result. The
+    underlying IP is the problem, not a transient failure.
+  - What worked: yt-dlp accepts a `cookiefile` (Netscape-format
+    `cookies.txt`) that authenticates as a logged-in browser session.
+    Export from a browser extension like "Get cookies.txt LOCALLY"
+    (Chrome/Firefox), upload to Drive or your local working dir, and
+    supply it via either the `COOKIEFILE_PATH` env var (one-time,
+    picked up everywhere) or the `cookiefile=` parameter directly.
+  - Root cause: YouTube's per-IP bot detection on cloud-provider
+    ranges. Cookies authenticate as a real browser session.
+  - Fix applied: `download_video` and `run_pipeline` now accept an
+    optional `cookiefile` parameter (default `None`, fully backward
+    compatible). Resolution order: explicit `cookiefile` arg →
+    `COOKIEFILE_PATH` env var → `None`. If set but the file is
+    missing, `download_video` raises `RuntimeError` early (before any
+    network call) with a remediation message. The cookiefile is
+    passed to BOTH the metadata probe and the actual download — the
+    probe can also trigger the bot check. The CLI smoke test got a
+    new `--cookiefile` flag. Cookies are NOT committed to the repo
+    (they're secrets) — users keep them on Drive or locally. The
+    Known Limitations #4 entry was updated to point at the new
+    functionality (the old text was factually wrong after this fix;
+    it told users to edit `dl_opts` manually, which is no longer
+    needed).
 

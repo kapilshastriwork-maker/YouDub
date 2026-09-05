@@ -333,6 +333,7 @@ def download_video(
     url: str,
     output_dir: str,
     max_duration_sec: int = 60,
+    cookiefile: Optional[str] = None,
 ) -> dict:
     """Download a YouTube Shorts / Instagram Reels URL to disk.
 
@@ -348,6 +349,13 @@ def download_video(
         Directory to write files into. Will be created if missing.
     max_duration_sec : int
         Reject the URL if yt-dlp reports a longer duration. Default 60.
+    cookiefile : str, optional
+        Path to a Netscape-format `cookies.txt` for yt-dlp authentication.
+        Required when running on cloud IPs (e.g. Colab) because YouTube's
+        bot detection flags Google Cloud ranges more aggressively than
+        residential IPs. Resolution order: this argument → `COOKIEFILE_PATH`
+        env var → `None`. If the resolved path doesn't exist, raises
+        `RuntimeError` before any network call.
 
     Returns
     -------
@@ -363,16 +371,32 @@ def download_video(
     ValueError
         If the URL is empty or the video is longer than `max_duration_sec`.
     RuntimeError
-        If yt-dlp cannot fetch the video for any reason (network, auth, geo).
+        If the resolved `cookiefile` path is missing, or yt-dlp cannot
+        fetch the video for any reason (network, auth, geo).
     """
     if not url or not isinstance(url, str):
         raise ValueError(f"download_video: invalid url: {url!r}")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
+    # Resolve cookiefile: explicit arg → env var → None. Validate eagerly
+    # so we fail before any network call with a clear remediation message.
+    resolved_cookiefile = cookiefile or os.environ.get("COOKIEFILE_PATH")
+    if resolved_cookiefile and not os.path.isfile(resolved_cookiefile):
+        raise RuntimeError(
+            f"download_video: cookiefile not found at {resolved_cookiefile!r}. "
+            f"Export cookies.txt from a browser logged into the target site "
+            f"(see progress.md), or unset COOKIEFILE_PATH / pass cookiefile=None."
+        )
+    if resolved_cookiefile:
+        log.info("download_video: using cookiefile=%s", resolved_cookiefile)
+
     import yt_dlp  # type: ignore
 
     # 1) Probe metadata only (no download) so we can check duration cheaply.
+    # Bot detection can fire on probe too, so pass cookiefile here as well.
     probe_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
+    if resolved_cookiefile:
+        probe_opts["cookiefile"] = resolved_cookiefile
     try:
         with yt_dlp.YoutubeDL(probe_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -409,6 +433,8 @@ def download_video(
         "sleep_interval_requests": 1,
         "max_sleep_interval_requests": 3,
     }
+    if resolved_cookiefile:
+        dl_opts["cookiefile"] = resolved_cookiefile
     try:
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             downloaded_info = ydl.extract_info(url, download=True)
@@ -1153,9 +1179,15 @@ def run_pipeline(
     whisper_compute_type: str = "float16",
     reference_duration_sec: int = 8,
     max_duration_sec: int = 60,
+    cookiefile: Optional[str] = None,
 ) -> str:
     """End-to-end dubbing pipeline. Runs all 7 stages in order with
     per-stage try/except and clear error messages.
+
+    `cookiefile` is passed through to Stage 1 (`download_video`) — see
+    that function's docstring for the resolution order and `COOKIEFILE_PATH`
+    env-var fallback. Required on Colab / cloud IPs to bypass YouTube's
+    bot detection.
 
     Returns the final dubbed video path. Raises PipelineError on any failure.
     """
@@ -1179,6 +1211,7 @@ def run_pipeline(
             url=url,
             output_dir=work,
             max_duration_sec=max_duration_sec,
+            cookiefile=cookiefile,
         ),
     )
     video_path = dl["video_path"]
@@ -1284,6 +1317,11 @@ if __name__ == "__main__":  # pragma: no cover
     p.add_argument("--out", default="./youdub_out", help="Output directory")
     p.add_argument("--ollama-model", default="llama3.1:8b")
     p.add_argument("--whisper-size", default="small")
+    p.add_argument(
+        "--cookiefile",
+        default=None,
+        help="Path to cookies.txt for yt-dlp auth (or set COOKIEFILE_PATH env var)",
+    )
     args = p.parse_args()
 
     out = run_pipeline(
@@ -1292,5 +1330,6 @@ if __name__ == "__main__":  # pragma: no cover
         output_dir=args.out,
         ollama_model=args.ollama_model,
         whisper_model_size=args.whisper_size,
+        cookiefile=args.cookiefile,
     )
     print(f"\nFinal dubbed video: {out}")
