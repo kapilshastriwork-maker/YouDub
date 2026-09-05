@@ -227,6 +227,7 @@ Supporting infrastructure:
    `COOKIEFILE_PATH` (or pass `cookiefile=` to `download_video` /
    `run_pipeline`) — see the "yt-dlp blocked by YouTube bot detection"
    entry in Errors & Fixes for setup details.
+4a. **For demo-day risk mitigation, prefer `local_file_path` over `url` when YouTube bot detection is likely.** `load_local_video` bypasses yt-dlp entirely; see the "YouTube bot detection is intermittent" entry in Errors & Fixes. This is also the natural UX for a future file-upload feature in the FastAPI frontend.
 5. **Ollama on the same Colab T4 will OOM once CosyVoice3 is loaded.**
    Combined VRAM ~3.5 GB; T4 has 16 GB so it should actually fit, but
    the first model load is slow and contention with the CUDA context is
@@ -628,4 +629,73 @@ files plus the output-laden notebooks, never the 10 GB of weights.
     functionality (the old text was factually wrong after this fix;
     it told users to edit `dl_opts` manually, which is no longer
     needed).
+
+- **post-Phase-1 — YouTube bot detection is intermittent on Colab; added local-file fallback for demo safety**
+  - What happened: The `cookiefile` fix (previous entry) made most
+    downloads work, but YouTube's bot detection is heuristic and
+    cloud-IP-restricted — a non-zero fraction of attempts still fail
+    even with valid cookies. For a live demo recording, this is a
+    real risk: a single failed download can derail the whole
+    presentation.
+  - What I tried: Retries, longer sleeps, multiple cookie files —
+    all reduce but don't eliminate the failure rate. The underlying
+    signal (cloud IP, heuristic check) is not deterministic.
+  - What worked: Bypass yt-dlp entirely. Add a direct local-file
+    input path. The user uploads a video via Colab's
+    `google.colab.files.upload()` (or any other means) and we treat
+    it as if `download_video` had just produced it. Same downstream
+    interface, zero changes to stages 2-7. The URL path remains
+    primary; local file is the documented fallback.
+  - Root cause: YouTube's bot detection is heuristic and
+    cloud-IP-restricted, not deterministic. Any in-band fix (cookies,
+    retries, throttling) has a non-zero failure rate. An out-of-band
+    path is more reliable than chasing the in-band failure rate
+    to zero.
+  - Fix applied: New `load_local_video(file_path, output_dir,
+    max_duration_sec=60) -> dict` function in `pipeline.py` with
+    the same return shape as `download_video`. Reuses
+    `_ffmpeg_extract_audio` and `_ffprobe_duration` so the audio
+    path is bit-identical to the URL flow. `run_pipeline` got a
+    new optional `local_file_path` parameter — if provided, used as
+    Stage 1 input (bypassing yt-dlp); if not, falls back to
+    `download_video(url=...)`. Silent precedence: if both `url` and
+    `local_file_path` are passed, `local_file_path` wins. The URL
+    is still required by the signature for backward compatibility
+    but can be a dummy value like `"local"` when
+    `local_file_path` is used. CLI smoke test got a new
+    `--local-file` flag. Known Limitations #4a was added to point
+    at the new fallback. This is also a natural direct feature for
+    the future FastAPI frontend (Phase 2): users can upload a file
+    instead of pasting a URL, which is both a better UX and removes
+    the bot-detection risk entirely from the user-facing flow.
+
+- **post-Phase-1 — faster-whisper CUDA runtime mismatch on Colab's T4 driver**
+  - What happened: `transcribe_audio` failed on Colab with
+    "CUDA driver version is insufficient for CUDA runtime version".
+    The T4 hardware is fine; faster-whisper's bundled CUDA runtime
+    (via CTranslate2) requires a newer NVIDIA driver than the Colab
+    T4 image ships by default.
+  - What I tried: Re-installing the CUDA toolkit, pinning ctranslate2
+    to an older build — same result. The driver/runtime version pair
+    on the Colab image is the boundary; the bundled runtime is too
+    new for it across multiple ctranslate2 versions.
+  - What worked: Switch the default to CPU with int8 quantization.
+    For 30-50s clips, CPU transcription is fast enough (a few seconds
+    on a Colab host) and keeps the GPU fully available for CosyVoice3
+    with no contention. GPU remains opt-in via `device="cuda"` for
+    hosts with a correct driver/runtime pair.
+  - Root cause: Colab's T4 image driver is too old for faster-whisper's
+    bundled CUDA runtime. Either pin the runtime back (fragile, version-
+    sensitive) or stop using GPU for this stage. CPU is the right call:
+    transcription is lightweight relative to TTS, and we want the GPU
+    dedicated to CosyVoice3.
+  - Fix applied: `transcribe_audio` defaults changed to
+    `device="cpu"`, `compute_type="int8"`. `run_pipeline` defaults
+    `whisper_device="cpu"`, `whisper_compute_type="int8"`. CLI smoke
+    test got `--whisper-device` and `--whisper-compute-type` flags so
+    GPU can still be forced on a working host. The `_get_whisper` cache
+    already invalidates correctly on param changes, so callers that
+    switch mid-session are handled. No change to `setup_colab.md` (the
+    new defaults are picked up automatically by the existing
+    `run_pipeline` call).
 

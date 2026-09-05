@@ -476,6 +476,90 @@ def download_video(
     }
 
 
+def load_local_video(
+    file_path: str,
+    output_dir: str,
+    max_duration_sec: int = 60,
+) -> dict:
+    """Stage-1 fallback: take an already-present local video file.
+
+    Use when yt-dlp can't fetch from a URL (e.g., YouTube bot detection
+    on cloud IPs even with valid cookies). The user uploads a file to
+    the Colab runtime via `google.colab.files.upload()` (or any other
+    means), and we treat it as if `download_video` had just produced it.
+    Downstream stages (transcribe / translate / TTS / mux) are unchanged
+    because the return shape is identical to `download_video`.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path to a local video file readable by ffmpeg
+        (mp4, mov, mkv, webm, avi, ...).
+    output_dir : str
+        Directory where the audio sidecar will be written. Will be
+        created if missing. The video file is not moved or copied; the
+        returned `video_path` points at `file_path` as-is.
+    max_duration_sec : int
+        Reject the file if it's longer than this. Default 60.
+
+    Returns
+    -------
+    dict with the same keys as `download_video`:
+        - "video_path": absolute path to the input file
+        - "audio_path": absolute path to the extracted .mp3
+        - "duration": float seconds
+        - "title": str (the file's stem, for logging)
+        - "uploader": str (always "" for local files)
+
+    Raises
+    ------
+    RuntimeError
+        If `file_path` doesn't exist, ffmpeg can't read it, or the
+        duration can't be determined.
+    ValueError
+        If the video is longer than `max_duration_sec`.
+    """
+    if not file_path or not isinstance(file_path, str):
+        raise ValueError(f"load_local_video: invalid file_path: {file_path!r}")
+    file_path = os.path.abspath(file_path)
+    if not os.path.isfile(file_path):
+        raise RuntimeError(
+            f"load_local_video: file not found at {file_path!r}. "
+            f"Upload it first (e.g., google.colab.files.upload()) and "
+            f"pass the resulting path."
+        )
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    video_path = file_path
+    audio_path = os.path.splitext(video_path)[0] + ".mp3"
+
+    duration = _ffprobe_duration(video_path)
+    if duration <= 0:
+        raise RuntimeError(
+            f"load_local_video: could not determine duration for {video_path} "
+            f"(unsupported format? corrupt file?)"
+        )
+    if duration > max_duration_sec:
+        raise ValueError(
+            f"load_local_video: video is {duration}s, exceeds max {max_duration_sec}s"
+        )
+
+    # Same audio extraction params as `download_video`'s fallback path,
+    # so downstream stages see an identical bitstream.
+    _ffmpeg_extract_audio(video_path, audio_path)
+    if not os.path.isfile(audio_path):
+        raise RuntimeError(f"load_local_video: ffmpeg ran but {audio_path} is missing")
+
+    log.info("load_local_video: %s -> %s (%.1fs)", video_path, audio_path, duration)
+    return {
+        "video_path": video_path,
+        "audio_path": audio_path,
+        "duration": float(duration),
+        "title": Path(file_path).stem,
+        "uploader": "",
+    }
+
+
 def _ffmpeg_extract_audio(video_path: str, audio_path: str) -> None:
     """Fallback: extract mono 16 kHz mp3 from a video file with ffmpeg."""
     cmd = [
@@ -505,8 +589,8 @@ def _ffmpeg_extract_audio(video_path: str, audio_path: str) -> None:
 def transcribe_audio(
     audio_path: str,
     model_size: str = "small",
-    device: str = "cuda",
-    compute_type: str = "float16",
+    device: str = "cpu",
+    compute_type: str = "int8",
     language: Optional[str] = None,
 ) -> list[dict]:
     """Transcribe an audio file with faster-whisper.
@@ -516,12 +600,21 @@ def transcribe_audio(
     audio_path : str
         Path to an audio file readable by ffmpeg (mp3/wav/m4a/...).
     model_size : str
-        faster-whisper model size. `small` is a good T4 default; `base` is
-        faster but worse; `large-v3` is best quality but ~3 GB VRAM.
+        faster-whisper model size. `small` is a good default; `base` is
+        faster but worse; `large-v3` is best quality but slower and
+        uses more RAM.
     device : str
-        `cuda` for GPU, `cpu` for fallback.
+        `cpu` (default). We default to CPU because (a) faster-whisper's
+        bundled CUDA runtime version mismatches Colab's T4 driver on the
+        default image (the well-known "CUDA driver version is insufficient
+        for CUDA runtime version" error), and (b) transcription on 30-50s
+        clips is fast enough on CPU that we keep the GPU fully available
+        for CosyVoice3 with no contention. Pass `device="cuda"` if you're
+        on a host with a working driver/runtime pair and want GPU
+        transcription.
     compute_type : str
-        `float16` on T4; `int8` on CPU.
+        `int8` on CPU (default). `float16` if you're forcing GPU on a
+        host where the driver/runtime pair is correct.
     language : str, optional
         Force a source language (e.g., "en") to skip auto-detection.
 
@@ -1175,11 +1268,12 @@ def run_pipeline(
     output_dir: str,
     ollama_model: str = "llama3.1:8b",
     whisper_model_size: str = "small",
-    whisper_device: str = "cuda",
-    whisper_compute_type: str = "float16",
+    whisper_device: str = "cpu",
+    whisper_compute_type: str = "int8",
     reference_duration_sec: int = 8,
     max_duration_sec: int = 60,
     cookiefile: Optional[str] = None,
+    local_file_path: Optional[str] = None,
 ) -> str:
     """End-to-end dubbing pipeline. Runs all 7 stages in order with
     per-stage try/except and clear error messages.
@@ -1188,6 +1282,16 @@ def run_pipeline(
     that function's docstring for the resolution order and `COOKIEFILE_PATH`
     env-var fallback. Required on Colab / cloud IPs to bypass YouTube's
     bot detection.
+
+    `local_file_path`, if provided, replaces Stage 1 entirely: the pipeline
+    reads an already-present local file (e.g., uploaded via
+    `google.colab.files.upload()`) instead of calling yt-dlp. This is
+    the reliable fallback when YouTube's bot detection is intermittently
+    blocking downloads, and is also the natural UX for a future file-upload
+    feature in the FastAPI frontend. If both `url` and `local_file_path`
+    are provided, `local_file_path` wins silently. URL is still required
+    by the signature for backward compatibility, but can be a dummy value
+    like `"local"` when `local_file_path` is used.
 
     Returns the final dubbed video path. Raises PipelineError on any failure.
     """
@@ -1204,19 +1308,32 @@ def run_pipeline(
         except Exception as e:
             raise PipelineError(f"[stage: {name}] failed: {e}") from e
 
-    # Stage 1: download
-    dl = _stage(
-        "1/7 download_video",
-        lambda: download_video(
-            url=url,
-            output_dir=work,
-            max_duration_sec=max_duration_sec,
-            cookiefile=cookiefile,
-        ),
-    )
+    # Stage 1: either load a local file (preferred when provided — bypasses
+    # yt-dlp entirely) or download from URL. The two functions return the
+    # same shape, so stages 2-7 are unchanged.
+    if local_file_path:
+        log.info("Stage 1: using local file %s (bypassing yt-dlp)", local_file_path)
+        dl = _stage(
+            "1/7 load_local_video",
+            lambda: load_local_video(
+                file_path=local_file_path,
+                output_dir=work,
+                max_duration_sec=max_duration_sec,
+            ),
+        )
+    else:
+        dl = _stage(
+            "1/7 download_video",
+            lambda: download_video(
+                url=url,
+                output_dir=work,
+                max_duration_sec=max_duration_sec,
+                cookiefile=cookiefile,
+            ),
+        )
     video_path = dl["video_path"]
     audio_path = dl["audio_path"]
-    log.info("downloaded: %s (%.1fs)", dl["title"], dl["duration"])
+    log.info("input: %s (%.1fs)", dl["title"], dl["duration"])
 
     # Stage 2: transcribe
     raw_segs = _stage(
@@ -1318,9 +1435,27 @@ if __name__ == "__main__":  # pragma: no cover
     p.add_argument("--ollama-model", default="llama3.1:8b")
     p.add_argument("--whisper-size", default="small")
     p.add_argument(
+        "--whisper-device",
+        default="cpu",
+        help="cuda or cpu (default: cpu; faster-whisper's CUDA runtime "
+        "mismatches Colab's T4 driver, so we default to CPU)",
+    )
+    p.add_argument(
+        "--whisper-compute-type",
+        default="int8",
+        help="float16, int8, etc. (default: int8; matches CPU default)",
+    )
+    p.add_argument(
         "--cookiefile",
         default=None,
         help="Path to cookies.txt for yt-dlp auth (or set COOKIEFILE_PATH env var)",
+    )
+    p.add_argument(
+        "--local-file",
+        default=None,
+        help="Path to a local video file (bypasses yt-dlp). Useful when "
+        "yt-dlp/YouTube is blocked, e.g., on Colab. If provided, the URL "
+        "argument is ignored.",
     )
     args = p.parse_args()
 
@@ -1330,6 +1465,9 @@ if __name__ == "__main__":  # pragma: no cover
         output_dir=args.out,
         ollama_model=args.ollama_model,
         whisper_model_size=args.whisper_size,
+        whisper_device=args.whisper_device,
+        whisper_compute_type=args.whisper_compute_type,
         cookiefile=args.cookiefile,
+        local_file_path=args.local_file,
     )
     print(f"\nFinal dubbed video: {out}")
